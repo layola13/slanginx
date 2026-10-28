@@ -7,73 +7,103 @@ design record is the sala planning page
 was renamed from the working name on that page to the repository
 name, slanginx).
 
-## M0 status (this delivery)
+## M1 status (this delivery)
 
-Working, acceptance-verified on a live server:
+Everything from M0, plus (details and measured evidence in
+`docs/M1_DELIVERY.md`):
 
-- **Static file serving** over the sa_std built-in HTTP/1.1
-  server face (std, not a plugin): GET/HEAD, byte-exact bodies,
-  404, MIME by extension, directory requests serve the index
-  file, **path-traversal containment** (a `..` that would escape
-  the root — raw or percent-encoded — is refused 403, never
-  clamped into the root).
-- **Two-layer configuration**:
-  - *Declarative layer* — `slanginx.toml` (see the shipped
-    sample): listen host/port, server root, index file, access
-    log path, buffered-read cap. Edit + restart takes effect,
-    no recompilation. A present key with the wrong type is a
-    startup error, not a silent default.
-  - *Code layer* — `src/config.sla`, a typed SLA module compiled
-    into the server: the `/internal/` deny rule (403 even though
-    the files exist), the `/assets/` alias to a second root, and
-    an ACL predicate built on the sa_std `ip.sla` value layer.
-- **Access log**: one line per request —
-  `<remote> <method> <path> <status> <body-bytes> "<user-agent>"`
-  appended to the configured file. The log file must be openable
-  at boot; a bad path fails startup (nginx behavior).
+- **Reverse proxying**: upstream pools and proxy routes in the
+  declarative layer (`[upstream.N]` / `[route.N]` in the TOML),
+  longest-prefix routing, round-robin server selection,
+  request-header forwarding (incl. `X-Forwarded-For` /
+  `X-Real-IP` from the real peer address), response-header
+  relay, chunked-streamed GET bodies, exact explicit errors:
+  upstream transport failure → **502**, upstream timeout →
+  **504**, upstream HTTP statuses relayed verbatim. No silent
+  fallbacks anywhere.
+- **Backfilled std faces** (delivered by the sa_std line into
+  sci, consumed here): HEAD responses carry the real
+  content-length (head response shape); the access log's remote
+  field is the real peer address and the code-layer ACL is
+  evaluated live per request; dedicated status route
+  `GET /__slanginx/status` reporting per-pool request/error
+  counters.
+- **Handler / shared-state model A** (ruling recorded in
+  `docs/HANDLER_MODEL.md`): handlers hold no global mutable
+  state; the only cross-request state is configuration-declared
+  **shared dict** zones (`[shared_dict.N]`, `src/shared_dict.sla`)
+  backed by sa_std named global cells — explicit get/set/incr
+  with logical TTL, explicit FULL when a zone's capacity is
+  exhausted (never eviction), backing the proxy statistics and
+  the status route.
+- **Benchmark gate vs native nginx** (see `scripts/bench/`):
+  same-machine wrk comparison — static small file, static large
+  file, reverse proxy — against the T50 thresholds (throughput
+  ≥ 50% of nginx, p99 latency ≤ 2x nginx). The measured table
+  and per-scenario verdicts are in `docs/M1_DELIVERY.md`.
 
-Process model for M0: single process, sequential accept loop.
+Still true from M0: static file serving over the sa_std
+built-in HTTP/1.1 server face (GET/HEAD, byte-exact bodies,
+404, MIME by extension, index files, path-traversal containment
+with explicit 403), the two-layer configuration (declarative
+TOML + typed code layer in `src/config.sla` with the
+`/internal/` deny rule and the `/assets/` alias), the access
+log (one line per request, real peer since M1), and the
+process model: single process, sequential accept loop.
 
-## Registered gaps (M0)
+## Registered gaps (M1)
 
-- **No sendfile / zero-copy send path exists in sa_std** (checked:
-  zero hits for sendfile across the sa_std declarations and the
-  sci runtime sources). M0 serves through a buffered path
-  (whole-file buffer under `max_file_bytes`, chunked streaming
-  above it). This is the known static-throughput ceiling until
-  the std surface grows a sendfile face.
-- **HEAD responses cannot carry the resource's content-length**
-  with the current std server face — measured on the wire, all
-  three response shapes fail differently (details in
-  docs/M0_DELIVERY.md). HEAD currently answers 200 +
-  content-type with an empty chunked body (protocol-valid, no
-  body bytes), and the gap is registered for the std surface.
-- **The access log's remote field is `-`**: the std server face
-  exposes no peer-address getter for a request handle. The
-  code-layer ACL predicate (`config_acl_allows`) is compiled in
-  and unit-tested but cannot be wired to live requests until
-  that getter exists.
+- **G3′ — no server-face send-file shape**: sa_std grew a
+  net-layer `send_file` (stream + file), but the HTTP server
+  face exposes no stream/fd accessor for a live request, so
+  static serving cannot use it; static files still go through
+  the buffered path. Seam marked in `src/main.sla`.
+- **G4 — query strings are not exposed**: the server face's
+  path getter returns the path only; proxied requests forward
+  the path without the query until a raw-target getter exists.
+- **G5 — client `user-agent` is not honored**: headers set via
+  the client face's add-header never include a user-agent on
+  the wire (std.http's default is sent); pinned by the repro
+  in `docs/repro/`.
+- **D5 — referee quirk**: repeating `PTR_BYTE_ADD(&local, 0)`
+  inline at several call sites traps UseAfterMove; the house
+  idiom binds the pointer once. Repro in `docs/repro/`.
+- **D6 — client HEAD send segfaults** in sa_std (signal 11
+  inside `req_send_v2`); the proxy fetches HEAD upstreams as
+  GET and relays headers without the body until this is fixed
+  upstream. Repro in `docs/repro/`.
 - Directory requested without a trailing slash is served its
-  index directly; nginx's 301 redirect is not issued in M0.
-- Reverse proxying, TLS/HTTP2 termination, rate limiting and
-  caching are later milestones (M1–M3 on the planning page), as
-  is the VM-plugin extension model.
+  index directly; nginx's 301 redirect is not issued.
+- TLS/HTTP2 termination, rate limiting and caching remain
+  later milestones (M2–M3 on the planning page), as is the
+  VM-plugin extension model.
 
 ## Layout
 
 ```
 src/main.sla        server entry: accept loop, dispatch, sending
-src/settings.sla    declarative layer: TOML -> Settings
+src/settings.sla    declarative layer: TOML -> all sections
 src/config.sla      code layer: deny rule, assets alias, ACL
 src/webpath.sla     percent-decoding, normalization, traversal
                     containment, MIME table
+src/upstream.sla    upstream pools, routes, round-robin pick
+src/proxy.sla       reverse-proxy exchange with the upstreams
+src/shared_dict.sla shared dict zones (handler model A)
 src/access_log.sla  access-log line format + append
 src/numfmt.sla      decimal formatting helper
-tests/              @test unit tests (webpath, config)
-scripts/acceptance.sh  live curl acceptance (three config runs)
+tests/              @test unit tests (webpath, config,
+                    upstream, shared_dict)
+scripts/acceptance.sh  live curl acceptance (four runs, incl.
+                    a real two-upstream proxy run)
+scripts/upstream_fixture.py  trivial upstream used by the
+                    acceptance and the bench
+scripts/bench/      nginx comparison gate (method + scripts)
 www/, www-assets/   sample roots used by the acceptance
 slanginx.toml       sample declarative configuration
-docs/M0_DELIVERY.md delivery note with measured evidence
+docs/M0_DELIVERY.md M0 delivery note with measured evidence
+docs/M1_DELIVERY.md M1 delivery note with measured evidence
+docs/HANDLER_MODEL.md handler/shared-state model ruling (A)
+docs/repro/         minimal repros for the registered defects
 ```
 
 ## Build and run
@@ -93,5 +123,8 @@ environment variable. Tests and acceptance:
 ```
 sa test tests/webpath_test.sla
 sa test tests/config_test.sla
+sa test tests/upstream_test.sla
+sa test tests/shared_dict_test.sla
 bash scripts/acceptance.sh
+bash scripts/bench/bench.sh      # needs apt nginx + wrk
 ```
