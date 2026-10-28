@@ -1,0 +1,473 @@
+// proxy: the reverse-proxy engine of slanginx (M1).
+//
+// A request whose normalized path matches a configured route
+// (upstream.sla) is forwarded to the route's upstream pool over
+// the sa_std HTTP client face, and the upstream response is
+// relayed back. Behavior, deliberately nginx-like and explicit:
+//
+//   - pools are tried in round-robin order; on a transport
+//     failure the next server in the pool is tried (that is
+//     upstream failover, not a silent fallback: when every
+//     server fails the client gets an explicit error);
+//   - error mapping: upstream timeout -> 504 "gateway timeout",
+//     any other transport failure (connect refused, reset,
+//     protocol) -> 502 "bad gateway". Upstream HTTP statuses --
+//     including 4xx/5xx -- are relayed verbatim, never mapped.
+//   - request headers forwarded by name (the server face has
+//     no header enumeration): accept, accept-language,
+//     accept-encoding, authorization, content-type, cookie,
+//     referer, user-agent; plus x-forwarded-for (client value
+//     extended with the peer address), x-real-ip and
+//     x-forwarded-proto, set from the G2 peer getter's value.
+//   - response headers relayed by name: content-type,
+//     cache-control, etag, last-modified, expires, location,
+//     www-authenticate, set-cookie, retry-after. The relay is
+//     chunked-streamed, so the upstream content-length is not
+//     forwarded (framing is hop-by-hop); HEAD relays use the
+//     G1 head shape and preserve the upstream content-length.
+//   - two std-face limits shape this module (registered in
+//     docs/M1_DELIVERY.md): the server face exposes no query
+//     string (G4 -- grep finds no "query" in the std server
+//     runtime at all), so the forwarded target is the path
+//     only; and a client HEAD request segfaults the std client
+//     inside req_send_v2 (D6, minimal repro on file), so HEAD
+//     is fetched upstream as GET and only its headers are
+//     relayed -- the client still receives a correct HEAD
+//     response, the upstream sees a GET. Also, the client
+//     face's add_header for user-agent never reaches the wire
+//     (G5: std.http's own default wins); the header stays in
+//     the forward list for the day the face honors it.
+//   - per-upstream request/error counters live in the shared
+//     dict zone named "stats" when the operator declares it
+//     (docs/HANDLER_MODEL.md): the only state this module
+//     touches, addressed explicitly by (zone, key). Counter
+//     failures never fail the proxied request -- they are
+//     observability, and the dict itself is unit-tested.
+//
+// One client is created per proxied request (no connection
+// pooling in M1); per-attempt timeout is 3000 ms.
+
+@import "sa_std/http_server.sai"
+@import "sa_std/http_client.sai"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "upstream.sla"
+@import "shared_dict.sla"
+@import "webpath.sla"
+@import "numfmt.sla"
+
+struct ProxyResult {
+    status: u32,
+    body_bytes: u64,
+}
+
+struct TextBuf {
+    bytes: [u8; 1600],
+    len: u64,
+}
+
+fn tb_new() -> TextBuf {
+    return TextBuf { bytes: [0u8; 1600], len: 0 };
+}
+
+fn tb_push(t: &TextBuf, src: ptr, n: u64) {
+    let i: u64 = 0;
+    while i < n {
+        if t.len < 1600 {
+            t.bytes[t.len] = PTR_BYTE_AT(src, i);
+            t.len = t.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn tb_push_byte(t: &TextBuf, b: u8) {
+    if t.len < 1600 {
+        t.bytes[t.len] = b;
+        t.len = t.len + 1;
+    };
+}
+
+fn tb_push_dec(t: &TextBuf, v: u64) {
+    let d = dec_u64(v);
+    let i: u64 = 0;
+    while i < d.len {
+        tb_push_byte(t, d.bytes[i]);
+        i = i + 1;
+    }
+}
+
+// Small fixed-body sender (same shape as main.sla's send_simple;
+// duplicated so this module does not depend on the entry unit).
+fn proxy_send_simple(req: ptr, status: u16, body: ptr, body_len: u64) -> u64 {
+    let resp: ptr = PTR_NULL();
+    if sa_http_server_resp_new_v2(req, status, &resp) != 0 {
+        return 0;
+    };
+    sa_http_server_resp_add_header_v2(resp, STR_PTR("content-type"), STR_LEN("content-type"), STR_PTR("text/plain"), STR_LEN("text/plain"));
+    if sa_http_server_resp_send_v2(resp, body, body_len, 5000) != 0 {
+        sa_http_server_resp_free_v2(resp);
+        return 0;
+    };
+    sa_http_server_resp_free_v2(resp);
+    return body_len;
+}
+
+// HTTP client method codes (sa_http_client methodFromCode):
+// GET=1 POST=2 PUT=3 DELETE=4 HEAD=5 PATCH=6. 0 = not proxied.
+fn proxy_method_code(m: ptr, m_len: u64) -> u8 {
+    if bytes_eq_lit(m, m_len, STR_PTR("GET"), STR_LEN("GET")) { return 1; };
+    if bytes_eq_lit(m, m_len, STR_PTR("POST"), STR_LEN("POST")) { return 2; };
+    if bytes_eq_lit(m, m_len, STR_PTR("PUT"), STR_LEN("PUT")) { return 3; };
+    if bytes_eq_lit(m, m_len, STR_PTR("DELETE"), STR_LEN("DELETE")) { return 4; };
+    if bytes_eq_lit(m, m_len, STR_PTR("HEAD"), STR_LEN("HEAD")) { return 5; };
+    if bytes_eq_lit(m, m_len, STR_PTR("PATCH"), STR_LEN("PATCH")) { return 6; };
+    return 0;
+}
+
+fn parse_u64_bytes(p: ptr, n: u64, out: &DictNum) -> bool {
+    if n == 0 {
+        return false;
+    };
+    let v: u64 = 0;
+    let i: u64 = 0;
+    while i < n {
+        let d: u8 = PTR_BYTE_AT(p, i);
+        if d < 48 {
+            return false;
+        };
+        if d > 57 {
+            return false;
+        };
+        v = v * 10 + ((d - 48) as u64);
+        i = i + 1;
+    }
+    out.value = v;
+    return true;
+}
+
+// --- stats counters (shared dict, zone "stats") ---
+
+fn stats_zone(dz: &DictZones, name_out: &TextBuf) -> i32 {
+    let zi: i32 = dictzones_find(dz, STR_PTR("stats"), STR_LEN("stats"));
+    if zi < 0 {
+        return -1;
+    };
+    let i: u64 = 0;
+    let base: u64 = (zi as u64) * 32;
+    while i < dz.name_lens[zi as u64] {
+        tb_push_byte(name_out, dz.names[base + i]);
+        i = i + 1;
+    }
+    return zi;
+}
+
+fn stats_key(pc: &ProxyConfig, pool_idx: u64, what: ptr, what_len: u64, out: &TextBuf) {
+    tb_push(out, STR_PTR("pool:"), STR_LEN("pool:"));
+    let i: u64 = 0;
+    while i < pc.pool_name_lens[pool_idx] {
+        tb_push_byte(out, pc.pool_names[pool_idx * 32 + i]);
+        i = i + 1;
+    }
+    tb_push_byte(out, 58);
+    tb_push(out, what, what_len);
+}
+
+fn stats_incr(pc: &ProxyConfig, dz: &DictZones, pool_idx: u64, what: ptr, what_len: u64, now: u64) {
+    let zname = tb_new();
+    if stats_zone(dz, &zname) < 0 {
+        return;
+    };
+    let key = tb_new();
+    stats_key(pc, pool_idx, what, what_len, &key);
+    let zp: ptr = PTR_BYTE_ADD(&zname.bytes, 0);
+    let kp: ptr = PTR_BYTE_ADD(&key.bytes, 0);
+    let res = DictNum { value: 0 };
+    dict_incr(zp, zname.len, kp, key.len, 1, 0, now, &res);
+}
+
+fn stats_read(pc: &ProxyConfig, dz: &DictZones, pool_idx: u64, what: ptr, what_len: u64, now: u64) -> u64 {
+    let zname = tb_new();
+    if stats_zone(dz, &zname) < 0 {
+        return 0;
+    };
+    let key = tb_new();
+    stats_key(pc, pool_idx, what, what_len, &key);
+    let zp: ptr = PTR_BYTE_ADD(&zname.bytes, 0);
+    let kp: ptr = PTR_BYTE_ADD(&key.bytes, 0);
+    let res = DictNum { value: 0 };
+    if dict_get_num(zp, zname.len, kp, key.len, &res, now) != 0 {
+        return 0;
+    };
+    return res.value;
+}
+
+// Body of the code-layer status route. Returns 0 when the
+// stats zone is declared (body built), 1 when it is not.
+fn proxy_status_body(pc: &ProxyConfig, dz: &DictZones, out: &TextBuf, now: u64) -> i32 {
+    let zname = tb_new();
+    if stats_zone(dz, &zname) < 0 {
+        return 1;
+    };
+    tb_push(out, STR_PTR("slanginx status\n"), STR_LEN("slanginx status\n"));
+    let i: u64 = 0;
+    while i < pc.pool_count {
+        tb_push(out, STR_PTR("upstream "), STR_LEN("upstream "));
+        let j: u64 = 0;
+        while j < pc.pool_name_lens[i] {
+            tb_push_byte(out, pc.pool_names[i * 32 + j]);
+            j = j + 1;
+        }
+        tb_push(out, STR_PTR(" requests "), STR_LEN(" requests "));
+        tb_push_dec(out, stats_read(pc, dz, i, STR_PTR("requests"), STR_LEN("requests"), now));
+        tb_push(out, STR_PTR(" errors "), STR_LEN(" errors "));
+        tb_push_dec(out, stats_read(pc, dz, i, STR_PTR("errors"), STR_LEN("errors"), now));
+        tb_push_byte(out, 10);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// --- header forwarding ---
+
+fn forward_one_header(req: ptr, ureq: ptr, name: ptr, name_len: u64) {
+    let v: ptr = PTR_NULL();
+    let vl: u64 = 0;
+    if sa_http_server_req_get_header(req, name, name_len, &v, &vl) == 0 {
+        sa_http_client_req_add_header_v2(ureq, name, name_len, v, vl);
+    };
+}
+
+fn proxy_forward_headers(req: ptr, ureq: ptr, peer: ptr, peer_len: u64, peer_known: bool) {
+    forward_one_header(req, ureq, STR_PTR("accept"), STR_LEN("accept"));
+    forward_one_header(req, ureq, STR_PTR("accept-language"), STR_LEN("accept-language"));
+    forward_one_header(req, ureq, STR_PTR("accept-encoding"), STR_LEN("accept-encoding"));
+    forward_one_header(req, ureq, STR_PTR("authorization"), STR_LEN("authorization"));
+    forward_one_header(req, ureq, STR_PTR("content-type"), STR_LEN("content-type"));
+    forward_one_header(req, ureq, STR_PTR("cookie"), STR_LEN("cookie"));
+    forward_one_header(req, ureq, STR_PTR("referer"), STR_LEN("referer"));
+    forward_one_header(req, ureq, STR_PTR("user-agent"), STR_LEN("user-agent"));
+    // x-forwarded-for: the client's own value (if any), extended
+    // with this hop's peer address.
+    let xff = tb_new();
+    let old: ptr = PTR_NULL();
+    let old_len: u64 = 0;
+    if sa_http_server_req_get_header(req, STR_PTR("x-forwarded-for"), STR_LEN("x-forwarded-for"), &old, &old_len) == 0 {
+        tb_push(&xff, old, old_len);
+    };
+    if peer_known {
+        if xff.len > 0 {
+            tb_push(&xff, STR_PTR(", "), STR_LEN(", "));
+        };
+        tb_push(&xff, peer, peer_len);
+        sa_http_client_req_add_header_v2(ureq, STR_PTR("x-real-ip"), STR_LEN("x-real-ip"), peer, peer_len);
+    };
+    if xff.len > 0 {
+        let xp: ptr = PTR_BYTE_ADD(&xff.bytes, 0);
+        sa_http_client_req_add_header_v2(ureq, STR_PTR("x-forwarded-for"), STR_LEN("x-forwarded-for"), xp, xff.len);
+    };
+    sa_http_client_req_add_header_v2(ureq, STR_PTR("x-forwarded-proto"), STR_LEN("x-forwarded-proto"), STR_PTR("http"), STR_LEN("http"));
+}
+
+fn relay_one_header(uresp: ptr, sresp: ptr, stream: bool, name: ptr, name_len: u64) {
+    let v: ptr = PTR_NULL();
+    let vl: u64 = 0;
+    if sa_http_client_resp_get_header(uresp, name, name_len, &v, &vl) == 0 {
+        if stream {
+            sa_http_server_resp_stream_add_header_v2(sresp, name, name_len, v, vl);
+        } else {
+            sa_http_server_resp_add_header_v2(sresp, name, name_len, v, vl);
+        };
+    };
+}
+
+fn proxy_relay_headers(uresp: ptr, sresp: ptr, stream: bool) {
+    relay_one_header(uresp, sresp, stream, STR_PTR("content-type"), STR_LEN("content-type"));
+    relay_one_header(uresp, sresp, stream, STR_PTR("cache-control"), STR_LEN("cache-control"));
+    relay_one_header(uresp, sresp, stream, STR_PTR("etag"), STR_LEN("etag"));
+    relay_one_header(uresp, sresp, stream, STR_PTR("last-modified"), STR_LEN("last-modified"));
+    relay_one_header(uresp, sresp, stream, STR_PTR("expires"), STR_LEN("expires"));
+    relay_one_header(uresp, sresp, stream, STR_PTR("location"), STR_LEN("location"));
+    relay_one_header(uresp, sresp, stream, STR_PTR("www-authenticate"), STR_LEN("www-authenticate"));
+    relay_one_header(uresp, sresp, stream, STR_PTR("set-cookie"), STR_LEN("set-cookie"));
+    relay_one_header(uresp, sresp, stream, STR_PTR("retry-after"), STR_LEN("retry-after"));
+}
+
+// --- one upstream attempt ---
+
+struct AttemptResult {
+    relayed: bool,
+    net_status: u32,
+    status: u32,
+    body_bytes: u64,
+}
+
+fn proxy_attempt(req: ptr, pc: &ProxyConfig, slot: u64,
+                 method_code: u8,
+                 target: ptr, target_len: u64,
+                 peer: ptr, peer_len: u64, peer_known: bool) -> AttemptResult {
+    let ar = AttemptResult { relayed: false, net_status: 6, status: 0, body_bytes: 0 };
+    // URL: http://host:port<target>
+    let url = tb_new();
+    tb_push(&url, STR_PTR("http://"), STR_LEN("http://"));
+    let hlen: u64 = pc.srv_host_lens[slot];
+    let j: u64 = 0;
+    while j < hlen {
+        tb_push_byte(&url, pc.srv_hosts[slot * 64 + j]);
+        j = j + 1;
+    }
+    tb_push_byte(&url, 58);
+    tb_push_dec(&url, pc.srv_ports[slot] as u64);
+    tb_push(&url, target, target_len);
+    let url_ptr: ptr = PTR_BYTE_ADD(&url.bytes, 0);
+    // D6 workaround: a client HEAD (method 5) crashes the std
+    // client inside req_send_v2, so HEAD is fetched as GET and
+    // relayed head-only below.
+    let wire_code: u8 = method_code;
+    if wire_code == 5 {
+        wire_code = 1;
+    };
+    let client: ptr = PTR_NULL();
+    if sa_http_client_new_v2(0, STR_PTR(""), 0, &client) != 0 {
+        ar.net_status = 6;
+        return ar;
+    };
+    let ureq: ptr = PTR_NULL();
+    if sa_http_client_req_new_v2(client, wire_code, url_ptr, url.len, &ureq) != 0 {
+        sa_http_client_free(client);
+        ar.net_status = 5;
+        return ar;
+    };
+    proxy_forward_headers(req, ureq, peer, peer_len, peer_known);
+    if method_code != 1 {
+        if method_code != 5 {
+            let bptr: ptr = PTR_NULL();
+            let blen: u64 = 0;
+            if sa_http_server_req_get_body(req, &bptr, &blen) == 0 {
+                if blen > 0 {
+                    sa_http_client_req_set_body_v2(ureq, bptr, blen);
+                };
+            };
+        };
+    };
+    sa_http_client_req_set_timeout_v2(ureq, 3000);
+    let uresp: ptr = PTR_NULL();
+    let st: u32 = sa_http_client_req_send_v2(ureq, &uresp);
+    if st != 0 {
+        sa_http_client_req_free(ureq);
+        sa_http_client_free(client);
+        ar.net_status = st;
+        return ar;
+    };
+    ar.status = sa_http_client_resp_status(uresp) as u32;
+    if method_code == 5 {
+        // HEAD relay (the response object answers the GET the
+        // D6 workaround sent): preserve the upstream
+        // content-length via the G1 head shape; the GET body is
+        // discarded unread and no body bytes reach the client.
+        let clen = DictNum { value: 0 };
+        let hv: ptr = PTR_NULL();
+        let hl: u64 = 0;
+        if sa_http_client_resp_get_header(uresp, STR_PTR("content-length"), STR_LEN("content-length"), &hv, &hl) == 0 {
+            parse_u64_bytes(hv, hl, &clen);
+        };
+        let sresp: ptr = PTR_NULL();
+        if sa_http_server_resp_new_v2(req, ar.status as u16, &sresp) == 0 {
+            proxy_relay_headers(uresp, sresp, false);
+            sa_http_server_resp_send_head_v2(sresp, clen.value, 5000);
+            sa_http_server_resp_free_v2(sresp);
+        };
+        ar.body_bytes = 0;
+    } else {
+        let sresp: ptr = PTR_NULL();
+        if sa_http_server_resp_stream_new_v2(req, ar.status as u16, &sresp) != 0 {
+            ar.body_bytes = 0;
+        } else {
+            proxy_relay_headers(uresp, sresp, true);
+            let rd: ptr = PTR_NULL();
+            let total: u64 = 0;
+            if sa_http_client_resp_body_reader(uresp, &rd) == 0 {
+                let chunk: [u8; 4096] = [0u8; 4096];
+                let chunk_ptr: ptr = PTR_BYTE_ADD(&chunk, 0);
+                let reading: bool = true;
+                while reading {
+                    let cl: u64 = 0;
+                    let rrc: u32 = sa_http_client_resp_read_chunk(rd, chunk_ptr, 4096, &cl);
+                    if rrc != 0 {
+                        reading = false;
+                    } else {
+                        if cl == 0 {
+                            reading = false;
+                        } else {
+                            sa_http_server_resp_stream_write_v2(sresp, chunk_ptr, cl, 5000);
+                            total = total + cl;
+                        };
+                    };
+                }
+                sa_http_client_body_reader_free(rd);
+            };
+            sa_http_server_resp_stream_end_v2(sresp, 5000);
+            sa_http_server_resp_stream_free_v2(sresp);
+            ar.body_bytes = total;
+        };
+    };
+    sa_http_client_resp_free(uresp);
+    sa_http_client_req_free(ureq);
+    sa_http_client_free(client);
+    ar.relayed = true;
+    return ar;
+}
+
+// --- entry point, called from the server core ---
+
+fn proxy_serve(req: ptr, pc: &ProxyConfig, dz: &DictZones,
+               route_idx: i32,
+               method_ptr: ptr, method_len: u64,
+               raw_ptr: ptr, raw_len: u64,
+               norm_ptr: ptr, norm_len: u64,
+               peer_ptr: ptr, peer_len: u64, peer_known: bool,
+               now: u64) -> ProxyResult {
+    let res = ProxyResult { status: 0, body_bytes: 0 };
+    let pool_idx: u64 = pc.route_pools[route_idx as u64];
+    let code: u8 = proxy_method_code(method_ptr, method_len);
+    if code == 0 {
+        res.status = 405;
+        res.body_bytes = proxy_send_simple(req, 405, STR_PTR("method not allowed\n"), STR_LEN("method not allowed\n"));
+        return res;
+    };
+    // Forward target: "/" + normalized path. The route prefix
+    // is NOT stripped (proxy_pass without a URI part). The
+    // query string cannot be forwarded: the server face's
+    // req_get_path returns the path only and no raw-target or
+    // query getter exists (G4) -- when one lands, the query is
+    // appended here. raw_ptr/raw_len are kept in the signature
+    // for that day and for the access path's symmetry.
+    let target = tb_new();
+    tb_push_byte(&target, 47);
+    tb_push(&target, norm_ptr, norm_len);
+    let target_ptr: ptr = PTR_BYTE_ADD(&target.bytes, 0);
+    stats_incr(pc, dz, pool_idx, STR_PTR("requests"), STR_LEN("requests"), now);
+    let server_count: u64 = pc.pool_server_counts[pool_idx];
+    let last_status: u32 = 6;
+    let attempt: u64 = 0;
+    while attempt < server_count {
+        let slot: u64 = proxyconf_pool_pick(pc, pool_idx);
+        let ar = proxy_attempt(req, pc, slot, code, target_ptr, target.len, peer_ptr, peer_len, peer_known);
+        if ar.relayed {
+            res.status = ar.status;
+            res.body_bytes = ar.body_bytes;
+            return res;
+        };
+        last_status = ar.net_status;
+        attempt = attempt + 1;
+    }
+    stats_incr(pc, dz, pool_idx, STR_PTR("errors"), STR_LEN("errors"), now);
+    if last_status == 3 {
+        res.status = 504;
+        res.body_bytes = proxy_send_simple(req, 504, STR_PTR("gateway timeout\n"), STR_LEN("gateway timeout\n"));
+        return res;
+    };
+    res.status = 502;
+    res.body_bytes = proxy_send_simple(req, 502, STR_PTR("bad gateway\n"), STR_LEN("bad gateway\n"));
+    return res;
+}

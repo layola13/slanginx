@@ -1,0 +1,69 @@
+// Unit tests for upstream.sla: server-list parsing, TOML fill,
+// route matching, round-robin selection.
+// Run from the repo root:
+//   sa test tests/upstream_test.sla
+
+@import "src/upstream.sla"
+@import "sa_std/encoding/toml.sai"
+@import "sa_std/encoding/toml.sla"
+@import "sa_std/string.sa"
+
+@test "server list parses host port pairs"() {
+    let pc = proxyconf_new();
+    if proxyconf_parse_servers(&pc, 0, STR_PTR("127.0.0.1:19001, 127.0.0.1:19002"), STR_LEN("127.0.0.1:19001, 127.0.0.1:19002")) != 0 { panic(401); };
+    if pc.pool_server_counts[0] != 2 { panic(402); };
+    if pc.srv_ports[0] != 19001 { panic(403); };
+    if pc.srv_ports[1] != 19002 { panic(404); };
+    if pc.srv_host_lens[0] != 9 { panic(405); };
+    if pc.srv_hosts[0] != 49 { panic(406); };
+    if pc.srv_hosts[8] != 49 { panic(407); };
+    // surrounding spaces are trimmed
+    let pc2 = proxyconf_new();
+    if proxyconf_parse_servers(&pc2, 1, STR_PTR(" 10.0.0.1:8080 "), STR_LEN(" 10.0.0.1:8080 ")) != 0 { panic(408); };
+    if pc2.pool_server_counts[1] != 1 { panic(409); };
+    if pc2.srv_host_lens[4] != 8 { panic(410); };
+    if pc2.srv_ports[4] != 8080 { panic(411); };
+}
+
+@test "server list rejects malformed entries"() {
+    let pc = proxyconf_new();
+    if proxyconf_parse_servers(&pc, 0, STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1")) == 0 { panic(421); };
+    if proxyconf_parse_servers(&pc, 0, STR_PTR("127.0.0.1:0"), STR_LEN("127.0.0.1:0")) == 0 { panic(422); };
+    if proxyconf_parse_servers(&pc, 0, STR_PTR("127.0.0.1:65536"), STR_LEN("127.0.0.1:65536")) == 0 { panic(423); };
+    if proxyconf_parse_servers(&pc, 0, STR_PTR(""), STR_LEN("")) == 0 { panic(424); };
+    if proxyconf_parse_servers(&pc, 0, STR_PTR("127.0.0.1:1,"), STR_LEN("127.0.0.1:1,")) == 0 { panic(425); };
+    if proxyconf_parse_servers(&pc, 0, STR_PTR("a:1,b:2,c:3,d:4,e:5"), STR_LEN("a:1,b:2,c:3,d:4,e:5")) == 0 { panic(426); };
+    if proxyconf_parse_servers(&pc, 0, STR_PTR("127.0.0.1:http"), STR_LEN("127.0.0.1:http")) == 0 { panic(427); };
+}
+
+@test "toml fill builds pools and routes, longest prefix wins"() {
+    let doc: u64 = sa_toml_parse(STR_PTR("[upstream.0]\nname = \"api\"\nservers = \"127.0.0.1:19001, 127.0.0.1:19002\"\n\n[upstream.1]\nname = \"dead\"\nservers = \"127.0.0.1:19999\"\n\n[route.0]\nprefix = \"/api/\"\nupstream = \"api\"\n\n[route.1]\nprefix = \"/api/v2/\"\nupstream = \"dead\"\n\n[route.2]\nprefix = \"/\"\nupstream = \"dead\"\n"), STR_LEN("[upstream.0]\nname = \"api\"\nservers = \"127.0.0.1:19001, 127.0.0.1:19002\"\n\n[upstream.1]\nname = \"dead\"\nservers = \"127.0.0.1:19999\"\n\n[route.0]\nprefix = \"/api/\"\nupstream = \"api\"\n\n[route.1]\nprefix = \"/api/v2/\"\nupstream = \"dead\"\n\n[route.2]\nprefix = \"/\"\nupstream = \"dead\"\n"));
+    if doc == 0 { panic(431); };
+    let pc = proxyconf_new();
+    if proxyconf_fill(&pc, doc) != 0 { panic(432); };
+    if pc.pool_count != 2 { panic(433); };
+    if pc.route_count != 3 { panic(434); };
+    if proxyconf_route_match(&pc, STR_PTR("api/echo"), STR_LEN("api/echo")) != 0 { panic(435); };
+    if proxyconf_route_match(&pc, STR_PTR("api/v2/x"), STR_LEN("api/v2/x")) != 1 { panic(436); };
+    if proxyconf_route_match(&pc, STR_PTR("other/page"), STR_LEN("other/page")) != 2 { panic(437); };
+    if pc.route_pools[1] != 1 { panic(438); };
+    sa_toml_free(doc);
+    // a route naming an undeclared pool is a hard fill error
+    let doc2: u64 = sa_toml_parse(STR_PTR("[route.0]\nprefix = \"/x/\"\nupstream = \"ghost\"\n"), STR_LEN("[route.0]\nprefix = \"/x/\"\nupstream = \"ghost\"\n"));
+    if doc2 == 0 { panic(439); };
+    let pc2 = proxyconf_new();
+    if proxyconf_fill(&pc2, doc2) == 0 { panic(440); };
+    sa_toml_free(doc2);
+}
+
+@test "round robin pick rotates and wraps"() {
+    if proxyconf_pick_at(0, 2) != 0 { panic(451); };
+    if proxyconf_pick_at(1, 2) != 1 { panic(452); };
+    if proxyconf_pick_at(2, 2) != 0 { panic(453); };
+    if proxyconf_pick_at(5, 3) != 2 { panic(454); };
+    let pc = proxyconf_new();
+    if proxyconf_parse_servers(&pc, 0, STR_PTR("127.0.0.1:19001, 127.0.0.1:19002"), STR_LEN("127.0.0.1:19001, 127.0.0.1:19002")) != 0 { panic(455); };
+    if proxyconf_pool_pick(&pc, 0) != 0 { panic(456); };
+    if proxyconf_pool_pick(&pc, 0) != 1 { panic(457); };
+    if proxyconf_pool_pick(&pc, 0) != 0 { panic(458); };
+}
