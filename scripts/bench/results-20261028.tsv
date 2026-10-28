@@ -1,0 +1,33 @@
+# slanginx vs nginx bench, 2026-10-28, Colab box 2d60bdf6bf1a.
+# nginx 1.24.0 (Ubuntu), wrk 4.1.0, median of 3 measured runs
+# (1 warmup discarded), 5 s per run. Full method: README.md in
+# this directory; analysis: docs/M1_DELIVERY.md section 5.
+# slanginx large c=10: process OOM-killed during this cell
+# (41.7 GB RSS, kernel log); values are the degrading rounds.
+# slanginx large c=50: not measurable (process did not survive
+# large c=10). slanginx proxy rows: addendum run, fresh process,
+# same method (the bench-run process was already dead).
+# fixture rows: direct to the python fixture; its p50 carries a
+# constant ~41 ms Nagle artifact (see delivery doc) and is NOT
+# the proxy ceiling (via nginx it serves 2.2-2.5k rps).
+server	scenario	c	rps	p50_ms	p99_ms
+nginx	small	1	18435.89	0.045	0.171
+slanginx	small	1	5068.51	0.194	0.285
+nginx	small	10	100423.41	0.090	0.225
+slanginx	small	10	5383.99	0.821	1.910
+nginx	small	50	132761.22	0.243	2.410
+slanginx	small	50	5989.59	0.420	1.210
+nginx	large	1	11134.22	0.085	0.156
+slanginx	large	1	2962.98	0.315	0.542
+nginx	large	10	36477.67	0.197	0.427
+slanginx	large	10	914.13	1.440	5.620
+nginx	large	50	37181.69	0.699	1.920
+nginx	proxy	1	2197.04	0.446	0.717
+slanginx	proxy	1	999.26	0.990	1.320
+nginx	proxy	10	2462.87	2.570	1130.000
+slanginx	proxy	10	1002.47	2.000	2.460
+nginx	proxy	50	2429.85	2.530	1170.000
+slanginx	proxy	50	989.99	2.000	2.630
+fixture	proxy	1	24.51	40.990	42.010
+fixture	proxy	10	229.58	40.990	42.010
+fixture	proxy	50	740.58	41.000	1220.000

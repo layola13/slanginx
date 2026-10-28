@@ -1,0 +1,21 @@
+# slanginx bench configuration: same www root and the same
+# trivial upstream (fixture on 19001) as the nginx instance.
+[server]
+host = "127.0.0.1"
+port = 18094
+root = "www"
+index = "index.html"
+access_log = "logs/bench-access.log"
+max_file_bytes = 33554432
+
+[upstream.0]
+name = "benchup"
+servers = "127.0.0.1:19001"
+
+[route.0]
+prefix = "/api/"
+upstream = "benchup"
+
+[shared_dict.0]
+name = "stats"
+capacity = 1024

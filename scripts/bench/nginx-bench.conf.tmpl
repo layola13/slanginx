@@ -1,0 +1,29 @@
+# nginx bench instance config (template; bench.sh substitutes
+# @REPO@ and @PREFIX@). Mirrors the apt nginx defaults that
+# matter for the comparison: worker_processes auto, sendfile on.
+# access_log is off in the Ubuntu default config only for the
+# default vhost's error path conventions -- here it is explicitly
+# off so the comparison measures request serving, not logging;
+# slanginx's own access log stays ON (it is part of the product
+# being measured, and the findings in docs/M1_DELIVERY.md call
+# that asymmetry out rather than hiding it).
+pid @PREFIX@/nginx.pid;
+error_log @PREFIX@/error.log;
+worker_processes auto;
+events {
+    worker_connections 1024;
+}
+http {
+    access_log off;
+    sendfile on;
+    tcp_nopush on;
+    server {
+        listen 127.0.0.1:18095;
+        root @REPO@/www;
+        location /api/ {
+            proxy_pass http://127.0.0.1:19001;
+        }
+        location / {
+        }
+    }
+}
