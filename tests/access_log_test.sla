@@ -1,0 +1,68 @@
+// Unit tests for the access log sink (src/access_log.sla, F3):
+// the sink is opened once and each line is written with a
+// single write on the persistent handle. These tests pin the
+// line format byte-for-byte (unchanged from M1), the append
+// semantics across calls, and the failure branches (append on
+// an unopened sink, open on an unusable path -- the boot
+// fail-fast the server relies on).
+// Run from the repo root:
+//   sa test tests/access_log_test.sla
+
+@import "src/access_log.sla"
+@import "sa_std/fs.sai"
+@import "sa_std/string.sa"
+
+fn bytes_eq(p: ptr, n: u64, lit: ptr, lit_len: u64) -> bool {
+    if n != lit_len {
+        return false;
+    };
+    let i: u64 = 0;
+    while i < n {
+        if PTR_BYTE_AT(p, i) != PTR_BYTE_AT(lit, i) {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+@test "access log: lines are byte-exact and appends accumulate (F3)"() {
+    let path: ptr = STR_PTR("/tmp/slanginx_access_log_test.log");
+    let plen: u64 = STR_LEN("/tmp/slanginx_access_log_test.log");
+    sa_std_fs_remove(path, plen);
+    let sink = logsink_new();
+    if access_log_open(&sink, path, plen) != 0 { panic(801); };
+    if access_log_append(&sink,
+                         STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1"),
+                         STR_PTR("GET"), STR_LEN("GET"),
+                         STR_PTR("/hello.txt"), STR_LEN("/hello.txt"),
+                         200, 32,
+                         STR_PTR("test-agent/1.0"), STR_LEN("test-agent/1.0")) != 0 { panic(802); };
+    if access_log_append(&sink,
+                         STR_PTR("10.0.0.9"), STR_LEN("10.0.0.9"),
+                         STR_PTR("POST"), STR_LEN("POST"),
+                         STR_PTR("/api/echo"), STR_LEN("/api/echo"),
+                         404, 10,
+                         STR_PTR("curl/8"), STR_LEN("curl/8")) != 0 { panic(803); };
+    let handle: u64 = 0;
+    if sa_std_fs_read_file(path, plen, 65536, &handle) != 0 { panic(804); };
+    let data: ptr = sa_fs_read_buffer_data(handle);
+    let dlen: u64 = sa_fs_read_buffer_len(handle);
+    let want: ptr = STR_PTR("127.0.0.1 GET /hello.txt 200 32 \"test-agent/1.0\"\n10.0.0.9 POST /api/echo 404 10 \"curl/8\"\n");
+    let want_len: u64 = STR_LEN("127.0.0.1 GET /hello.txt 200 32 \"test-agent/1.0\"\n10.0.0.9 POST /api/echo 404 10 \"curl/8\"\n");
+    if bytes_eq(data, dlen, want, want_len) { } else { panic(805); };
+    sa_fs_read_buffer_free(handle);
+    sa_std_fs_remove(path, plen);
+}
+
+@test "access log: unopened sink refuses; bad path fails fast (F3)"() {
+    let sink = logsink_new();
+    if access_log_append(&sink,
+                         STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1"),
+                         STR_PTR("GET"), STR_LEN("GET"),
+                         STR_PTR("/x"), STR_LEN("/x"),
+                         200, 1,
+                         STR_PTR("ua"), STR_LEN("ua")) == 0 { panic(811); };
+    let sink2 = logsink_new();
+    if access_log_open(&sink2, STR_PTR("/no-such-dir-zzz/access.log"), STR_LEN("/no-such-dir-zzz/access.log")) == 0 { panic(812); };
+}

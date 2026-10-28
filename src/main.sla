@@ -510,9 +510,12 @@ fn main() -> i32 {
     if lrc == 1 {
         println("slanginx: no config file found, using built-in defaults");
     };
-    // --- the access log must be openable at boot (fail fast) ---
+    // --- the access log is opened once at boot (fail fast on a
+    // bad path, as the M1 probe did) and held for the process
+    // lifetime (F3: no per-request open/seek/close) ---
     let log_ptr: ptr = PTR_BYTE_ADD(&s.log_path, 0);
-    if access_log_probe(log_ptr, s.log_len) != 0 {
+    let sink = logsink_new();
+    if access_log_open(&sink, log_ptr, s.log_len) != 0 {
         println("slanginx: cannot open access log for append");
         return 2;
     };
@@ -546,7 +549,7 @@ fn main() -> i32 {
             let p_ptr2: ptr = PTR_BYTE_ADD(&o.path, 0);
             let ua_ptr2: ptr = PTR_BYTE_ADD(&o.ua, 0);
             let r_ptr2: ptr = PTR_BYTE_ADD(&o.remote, 0);
-            access_log_append(log_ptr, s.log_len,
+            access_log_append(&sink,
                               r_ptr2, o.remote_len,
                               m_ptr2, o.method_len,
                               p_ptr2, o.path_len,

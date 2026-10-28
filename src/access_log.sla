@@ -6,56 +6,71 @@
 //
 //   <remote> <method> <path> <status> <body-bytes> "<user-agent>"
 //
-// <remote> is the client address. The std HTTP server face has no
-// peer-address getter for a request handle, so until that surface
-// exists the caller passes "-" and this module writes it verbatim;
-// the gap is registered in docs/M0_DELIVERY.md.
+// <remote> is the client address (the G2 peer getter's value,
+// wired by the caller; "-" when the peer is unknown).
+//
+// Syscall shape (F3): M1 opened, sought and closed the log file
+// for EVERY request -- open/write/close plus a path resolution
+// per line, ~53 us/request in the M1 strace attribution
+// (docs/M1_DELIVERY.md section 5). The sink now opens the file
+// ONCE at boot (which doubles as the old fail-fast probe: a bad
+// log path still fails the boot, never silently per request),
+// seeks to the end once, and writes each assembled line with a
+// single write_all on the persistent handle: one syscall per
+// line, none for open/seek/close. The handle is never re-opened
+// at runtime, so if the file is truncated or rotated externally
+// the operator restarts slanginx to pick up the new file. A
+// failed write returns its status and that line is dropped --
+// the same visibility contract as M1's failed per-request open.
 
 @import "sa_std/fs.sai"
 @import "sa_std/ptr.sa"
 @import "sa_std/string.sa"
 @import "numfmt.sla"
 
-struct LogLine {
+struct LogSink {
+    fh: u64,
+    ready: bool,
     bytes: [u8; 2048],
     len: u64,
 }
 
-fn logline_new() -> LogLine {
-    return LogLine { bytes: [0u8; 2048], len: 0 };
+fn logsink_new() -> LogSink {
+    return LogSink { fh: 0, ready: false, bytes: [0u8; 2048], len: 0 };
 }
 
-fn logline_push(l: &LogLine, src: ptr, n: u64) {
+fn sink_push(s: &LogSink, src: ptr, n: u64) {
     let i: u64 = 0;
     while i < n {
-        if l.len < 2048 {
-            l.bytes[l.len] = PTR_BYTE_AT(src, i);
-            l.len = l.len + 1;
+        if s.len < 2048 {
+            s.bytes[s.len] = PTR_BYTE_AT(src, i);
+            s.len = s.len + 1;
         };
         i = i + 1;
     }
 }
 
-fn logline_push_byte(l: &LogLine, b: u8) {
-    if l.len < 2048 {
-        l.bytes[l.len] = b;
-        l.len = l.len + 1;
+fn sink_push_byte(s: &LogSink, b: u8) {
+    if s.len < 2048 {
+        s.bytes[s.len] = b;
+        s.len = s.len + 1;
     };
 }
 
-fn logline_push_dec(l: &LogLine, v: u64) {
+fn sink_push_dec(s: &LogSink, v: u64) {
     let d = dec_u64(v);
     let i: u64 = 0;
     while i < d.len {
-        logline_push_byte(l, d.bytes[i]);
+        sink_push_byte(s, d.bytes[i]);
         i = i + 1;
     }
 }
 
-// Open the log for append and close it again: startup probe so a
-// bad log path fails fast at boot (nginx behavior), not silently
-// per request.
-fn access_log_probe(log_ptr: ptr, log_len: u64) -> i32 {
+// Open the log once, for append: create-if-missing without
+// truncating (open_write with truncate=0), then seek to the end
+// once. Any failure is returned so the boot fails fast, exactly
+// like the M1 probe.
+fn access_log_open(s: &LogSink, log_ptr: ptr, log_len: u64) -> i32 {
     let fh: u64 = 0;
     let ost: i32 = sa_std_fs_open_write(log_ptr, log_len, 0, &fh);
     if ost != 0 {
@@ -63,41 +78,39 @@ fn access_log_probe(log_ptr: ptr, log_len: u64) -> i32 {
     };
     let pos: u64 = 0;
     let sst: i32 = sa_std_fs_file_seek(fh, 2, 0, &pos);
-    sa_fs_file_close(fh);
-    return sst;
+    if sst != 0 {
+        sa_fs_file_close(fh);
+        return sst;
+    };
+    s.fh = fh;
+    s.ready = true;
+    return 0;
 }
 
-fn access_log_append(log_ptr: ptr, log_len: u64,
+fn access_log_append(s: &LogSink,
                      remote_ptr: ptr, remote_len: u64,
                      method_ptr: ptr, method_len: u64,
                      path_ptr: ptr, path_len: u64,
                      status: u32, body_bytes: u64,
                      ua_ptr: ptr, ua_len: u64) -> i32 {
-    let line = logline_new();
-    logline_push(&line, remote_ptr, remote_len);
-    logline_push_byte(&line, 32);
-    logline_push(&line, method_ptr, method_len);
-    logline_push_byte(&line, 32);
-    logline_push(&line, path_ptr, path_len);
-    logline_push_byte(&line, 32);
-    logline_push_dec(&line, status as u64);
-    logline_push_byte(&line, 32);
-    logline_push_dec(&line, body_bytes);
-    logline_push_byte(&line, 32);
-    logline_push_byte(&line, 34);
-    logline_push(&line, ua_ptr, ua_len);
-    logline_push_byte(&line, 34);
-    logline_push_byte(&line, 10);
-    let fh: u64 = 0;
-    let ost: i32 = sa_std_fs_open_write(log_ptr, log_len, 0, &fh);
-    if ost != 0 {
-        return ost;
+    if !s.ready {
+        return 1;
     };
-    let pos: u64 = 0;
-    sa_std_fs_file_seek(fh, 2, 0, &pos);
-    let line_ptr: ptr = PTR_BYTE_ADD(&line.bytes, 0);
-    let written: u64 = 0;
-    let wst: i32 = sa_std_fs_file_write(fh, line_ptr, line.len, &written);
-    sa_fs_file_close(fh);
-    return wst;
+    s.len = 0;
+    sink_push(s, remote_ptr, remote_len);
+    sink_push_byte(s, 32);
+    sink_push(s, method_ptr, method_len);
+    sink_push_byte(s, 32);
+    sink_push(s, path_ptr, path_len);
+    sink_push_byte(s, 32);
+    sink_push_dec(s, status as u64);
+    sink_push_byte(s, 32);
+    sink_push_dec(s, body_bytes);
+    sink_push_byte(s, 32);
+    sink_push_byte(s, 34);
+    sink_push(s, ua_ptr, ua_len);
+    sink_push_byte(s, 34);
+    sink_push_byte(s, 10);
+    let line_ptr: ptr = PTR_BYTE_ADD(&s.bytes, 0);
+    return sa_fs_file_write_all(s.fh, line_ptr, s.len);
 }
