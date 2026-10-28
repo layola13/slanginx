@@ -1,0 +1,13 @@
+# slanginx declarative configuration -- layer 1 of 2 (data layer).
+# Edit and restart the server; no recompilation needed.
+# Anything absent keeps the built-in default; a key with the wrong
+# type is a startup error. Routing rules and ACLs are NOT here:
+# they are the code layer, src/config.sla.
+
+[server]
+host = "127.0.0.1"
+port = 18090
+root = "www"
+index = "index.html"
+access_log = "logs/access.log"
+max_file_bytes = 33554432

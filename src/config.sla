@@ -1,0 +1,114 @@
+// config: the code layer of slanginx configuration.
+//
+// Where settings.sla is data (TOML, edited by the operator), this
+// module is a typed SLA program compiled into the server: routing
+// rules and access predicates are ordinary functions, type-checked
+// at build time, free to use the sa_std value layers (here: the
+// ip.sla address/prefix algebra). Changing a rule here means
+// recompiling -- that is the point of the layer, and the split is
+// deliberate:
+//
+//   TOML layer (settings.sla): listen address, roots, log path.
+//   Code layer (this file):     which paths are denied, which
+//                               prefix is aliased to another root,
+//                               which networks the ACL refuses.
+//
+// Live behavior driven by this layer (acceptance-verified):
+//   - requests whose normalized path is "internal" or under
+//     "internal/" are refused with 403, even though the files
+//     exist on disk under the server root;
+//   - requests under "assets/" are aliased to a different root
+//     directory (config_assets_root below).
+//
+// The ACL predicate (config_acl_allows) is compiled in and covered
+// by unit tests, but is NOT yet wired to live requests: the std
+// HTTP server face exposes no peer-address getter for a request
+// handle, so there is no client address to evaluate it against.
+// That gap is registered in docs/M0_DELIVERY.md; the predicate is
+// ready the day the getter exists.
+
+@import "sa_std/ip.sla"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "webpath.sla"
+
+struct AssetsRoot {
+    bytes: [u8; 128],
+    len: u64,
+}
+
+// The root that "assets/" requests are aliased to (code-layer
+// constant; deliberately NOT a TOML key).
+fn config_assets_root() -> AssetsRoot {
+    let r = AssetsRoot { bytes: [0u8; 128], len: 0 };
+    let lit: ptr = STR_PTR("www-assets");
+    let n: u64 = STR_LEN("www-assets");
+    let i: u64 = 0;
+    while i < n {
+        r.bytes[i] = PTR_BYTE_AT(lit, i);
+        i = i + 1;
+    }
+    r.len = n;
+    return r;
+}
+
+// True when the normalized path is exactly "assets" or lives
+// under "assets/".
+fn config_route_is_assets(norm: ptr, norm_len: u64) -> bool {
+    if bytes_eq_lit(norm, norm_len, STR_PTR("assets"), STR_LEN("assets")) {
+        return true;
+    };
+    return bytes_starts_with_lit(norm, norm_len, STR_PTR("assets/"), STR_LEN("assets/"));
+}
+
+// True when the normalized path is exactly "internal" or lives
+// under "internal/": the code-layer deny rule.
+fn config_path_denied(norm: ptr, norm_len: u64) -> bool {
+    if bytes_eq_lit(norm, norm_len, STR_PTR("internal"), STR_LEN("internal")) {
+        return true;
+    };
+    return bytes_starts_with_lit(norm, norm_len, STR_PTR("internal/"), STR_LEN("internal/"));
+}
+
+// One ACL table entry: is `addr` inside the prefix spelled by
+// `prefix_text`? Unparseable table text denies nothing (returns
+// false) -- table entries are compile-time constants below, and
+// the unit tests pin their behavior.
+fn acl_entry_matches(prefix_text: String, addr: IpAddr) -> bool {
+    let parsed = ip_prefix_parse(prefix_text);
+    let hit: bool = false;
+    match parsed {
+        Some(prefix) => {
+            hit = ip_prefix_contains_addr(prefix, addr);
+        },
+        None => {
+            hit = false;
+        }
+    }
+    return hit;
+}
+
+// Code-layer ACL: RFC1918 private networks are refused; anything
+// else parseable is allowed; unparseable input is refused.
+fn config_acl_allows(ip_text: String) -> bool {
+    let parsed = ip_addr_parse(ip_text);
+    let allowed: bool = false;
+    match parsed {
+        Some(addr) => {
+            allowed = true;
+            if acl_entry_matches("10.0.0.0/8", addr) {
+                allowed = false;
+            };
+            if acl_entry_matches("172.16.0.0/12", addr) {
+                allowed = false;
+            };
+            if acl_entry_matches("192.168.0.0/16", addr) {
+                allowed = false;
+            };
+        },
+        None => {
+            allowed = false;
+        }
+    }
+    return allowed;
+}

@@ -1,0 +1,356 @@
+// webpath: request-path handling for slanginx.
+//
+// - percent-decoding of the raw request path,
+// - dot-segment normalization with traversal containment: a ".."
+//   segment that would escape the server root is reported, never
+//   silently clamped,
+// - MIME lookup by file extension.
+//
+// Pure functions over (ptr, len) byte strings. Outputs land in
+// caller-owned structs so no string constant crosses a unit
+// boundary by value.
+
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+
+struct ResolvedPath {
+    bytes: [u8; 1024],
+    len: u64,
+    ended_with_slash: bool,
+}
+
+struct DecodedPath {
+    bytes: [u8; 1024],
+    len: u64,
+}
+
+// webpath_resolve result codes:
+//   0 = ok
+//   1 = traversal attempt (".." would escape the root)
+//   2 = malformed (bad percent escape, decoded NUL, path too long)
+
+fn resolved_new() -> ResolvedPath {
+    return ResolvedPath { bytes: [0u8; 1024], len: 0, ended_with_slash: false };
+}
+
+fn hex_val(b: u8) -> i32 {
+    if b >= 48 {
+        if b <= 57 {
+            return (b - 48) as i32;
+        };
+    };
+    if b >= 65 {
+        if b <= 70 {
+            return (b - 55) as i32;
+        };
+    };
+    if b >= 97 {
+        if b <= 102 {
+            return (b - 87) as i32;
+        };
+    };
+    return -1;
+}
+
+// Byte-for-byte comparison of a (ptr, len) string with a literal.
+fn bytes_eq_lit(p: ptr, n: u64, lit: ptr, lit_len: u64) -> bool {
+    if n != lit_len {
+        return false;
+    };
+    let i: u64 = 0;
+    while i < n {
+        if PTR_BYTE_AT(p, i) != PTR_BYTE_AT(lit, i) {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn bytes_starts_with_lit(p: ptr, n: u64, lit: ptr, lit_len: u64) -> bool {
+    if n < lit_len {
+        return false;
+    };
+    let i: u64 = 0;
+    while i < lit_len {
+        if PTR_BYTE_AT(p, i) != PTR_BYTE_AT(lit, i) {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+// Compare a resolved path's text with a literal (test/debug helper).
+fn resolved_text_eq(r: &ResolvedPath, lit: ptr, lit_len: u64) -> bool {
+    if r.len != lit_len {
+        return false;
+    };
+    let base: ptr = PTR_BYTE_ADD(&r.bytes, 0);
+    let i: u64 = 0;
+    while i < lit_len {
+        if PTR_BYTE_AT(base, i) != PTR_BYTE_AT(lit, i) {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn webpath_resolve(raw: ptr, raw_len: u64, out: &ResolvedPath) -> i32 {
+    // 1. The path portion ends at '?' or '#'.
+    let plen: u64 = 0;
+    let scanning: bool = true;
+    while scanning {
+        if plen >= raw_len {
+            scanning = false;
+        } else {
+            let b: u8 = PTR_BYTE_AT(raw, plen);
+            if b == 63 {
+                scanning = false;
+            } else {
+                if b == 35 {
+                    scanning = false;
+                } else {
+                    plen = plen + 1;
+                };
+            };
+        };
+    }
+    // 2. Percent-decode into scratch.
+    let dec = DecodedPath { bytes: [0u8; 1024], len: 0 };
+    let i: u64 = 0;
+    while i < plen {
+        let b: u8 = PTR_BYTE_AT(raw, i);
+        if b == 37 {
+            if i + 2 >= plen {
+                return 2;
+            };
+            let h: i32 = hex_val(PTR_BYTE_AT(raw, i + 1));
+            let l: i32 = hex_val(PTR_BYTE_AT(raw, i + 2));
+            if h < 0 {
+                return 2;
+            };
+            if l < 0 {
+                return 2;
+            };
+            let v: u8 = (h * 16 + l) as u8;
+            if v == 0 {
+                return 2;
+            };
+            if dec.len >= 1024 {
+                return 2;
+            };
+            dec.bytes[dec.len] = v;
+            dec.len = dec.len + 1;
+            i = i + 3;
+        } else {
+            if dec.len >= 1024 {
+                return 2;
+            };
+            dec.bytes[dec.len] = b;
+            dec.len = dec.len + 1;
+            i = i + 1;
+        };
+    }
+    out.ended_with_slash = false;
+    if dec.len == 0 {
+        out.ended_with_slash = true;
+    } else {
+        if dec.bytes[dec.len - 1] == 47 {
+            out.ended_with_slash = true;
+        };
+    }
+    // 3. Dot-segment processing over the decoded path.
+    out.len = 0;
+    let seg: u64 = 0;
+    let pos: u64 = 0;
+    let walking: bool = true;
+    while walking {
+        if pos > dec.len {
+            walking = false;
+        } else {
+            let at_end: bool = pos == dec.len;
+            let at_sep: bool = false;
+            if pos < dec.len {
+                if dec.bytes[pos] == 47 {
+                    at_sep = true;
+                };
+            };
+            if at_end {
+                if seg < pos {
+                    let rc: i32 = push_segment(&dec, seg, pos, out);
+                    if rc != 0 {
+                        return rc;
+                    };
+                };
+                walking = false;
+            } else {
+                if at_sep {
+                    if seg < pos {
+                        let rc: i32 = push_segment(&dec, seg, pos, out);
+                        if rc != 0 {
+                            return rc;
+                        };
+                    };
+                    pos = pos + 1;
+                    seg = pos;
+                } else {
+                    pos = pos + 1;
+                };
+            };
+        };
+    }
+    return 0;
+}
+
+// Push one decoded segment dec[start..end] into the normalized
+// output, applying "." (skip) and ".." (pop, or traversal error).
+fn push_segment(dec: &DecodedPath, start: u64, end: u64, out: &ResolvedPath) -> i32 {
+    let n: u64 = end - start;
+    if n == 1 {
+        if dec.bytes[start] == 46 {
+            return 0;
+        };
+    };
+    if n == 2 {
+        if dec.bytes[start] == 46 {
+            if dec.bytes[start + 1] == 46 {
+                // "..": pop the last output segment.
+                if out.len == 0 {
+                    return 1;
+                };
+                let k: u64 = out.len;
+                let cutting: bool = true;
+                while cutting {
+                    if k == 0 {
+                        out.len = 0;
+                        cutting = false;
+                    } else {
+                        if out.bytes[k - 1] == 47 {
+                            out.len = k - 1;
+                            cutting = false;
+                        } else {
+                            k = k - 1;
+                        };
+                    };
+                }
+                return 0;
+            };
+        };
+    };
+    // Regular segment: append with a '/' separator when non-empty.
+    let need: u64 = n;
+    if out.len > 0 {
+        need = need + 1;
+    };
+    if out.len + need > 1024 {
+        return 2;
+    };
+    if out.len > 0 {
+        out.bytes[out.len] = 47;
+        out.len = out.len + 1;
+    };
+    let j: u64 = 0;
+    while j < n {
+        out.bytes[out.len] = dec.bytes[start + j];
+        out.len = out.len + 1;
+        j = j + 1;
+    }
+    return 0;
+}
+
+// ---- MIME ----
+
+struct MimeType {
+    bytes: [u8; 40],
+    len: u64,
+}
+
+fn mime_new() -> MimeType {
+    return MimeType { bytes: [0u8; 40], len: 0 };
+}
+
+fn mime_fill(out: &MimeType, lit: ptr, lit_len: u64) {
+    let dst: ptr = PTR_BYTE_ADD(&out.bytes, 0);
+    PTR_COPY_BYTES(dst, lit, lit_len);
+    out.len = lit_len;
+}
+
+fn lower_byte(b: u8) -> u8 {
+    if b >= 65 {
+        if b <= 90 {
+            return b + 32;
+        };
+    };
+    return b;
+}
+
+// Extension (bytes after the last '.', folded to lowercase) equals lit?
+fn ext_eq(path: ptr, path_len: u64, dot: u64, lit: ptr, lit_len: u64) -> bool {
+    if path_len - dot - 1 != lit_len {
+        return false;
+    };
+    let i: u64 = 0;
+    while i < lit_len {
+        if lower_byte(PTR_BYTE_AT(path, dot + 1 + i)) != PTR_BYTE_AT(lit, i) {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn webpath_mime(path: ptr, path_len: u64, out: &MimeType) {
+    // Find the last '.' that sits after the last '/'.
+    let dot: u64 = 0;
+    let has_dot: bool = false;
+    let i: u64 = 0;
+    while i < path_len {
+        let b: u8 = PTR_BYTE_AT(path, i);
+        if b == 47 {
+            has_dot = false;
+        };
+        if b == 46 {
+            dot = i;
+            has_dot = true;
+        };
+        i = i + 1;
+    }
+    if has_dot {
+        if ext_eq(path, path_len, dot, STR_PTR("html"), STR_LEN("html")) { mime_fill(out, STR_PTR("text/html"), STR_LEN("text/html")); return; };
+        if ext_eq(path, path_len, dot, STR_PTR("htm"), STR_LEN("htm")) { mime_fill(out, STR_PTR("text/html"), STR_LEN("text/html")); return; };
+        if ext_eq(path, path_len, dot, STR_PTR("css"), STR_LEN("css")) { mime_fill(out, STR_PTR("text/css"), STR_LEN("text/css")); return; };
+        if ext_eq(path, path_len, dot, STR_PTR("js"), STR_LEN("js")) { mime_fill(out, STR_PTR("text/javascript"), STR_LEN("text/javascript")); return; };
+        if ext_eq(path, path_len, dot, STR_PTR("mjs"), STR_LEN("mjs")) { mime_fill(out, STR_PTR("text/javascript"), STR_LEN("text/javascript")); return; };
+        if ext_eq(path, path_len, dot, STR_PTR("json"), STR_LEN("json")) { mime_fill(out, STR_PTR("application/json"), STR_LEN("application/json")); return; };
+        if ext_eq(path, path_len, dot, STR_PTR("txt"), STR_LEN("txt")) { mime_fill(out, STR_PTR("text/plain"), STR_LEN("text/plain")); return; };
+        if ext_eq(path, path_len, dot, STR_PTR("md"), STR_LEN("md")) { mime_fill(out, STR_PTR("text/markdown"), STR_LEN("text/markdown")); return; };
+        if ext_eq(path, path_len, dot, STR_PTR("png"), STR_LEN("png")) { mime_fill(out, STR_PTR("image/png"), STR_LEN("image/png")); return; };
+        if ext_eq(path, path_len, dot, STR_PTR("jpg"), STR_LEN("jpg")) { mime_fill(out, STR_PTR("image/jpeg"), STR_LEN("image/jpeg")); return; };
+        if ext_eq(path, path_len, dot, STR_PTR("jpeg"), STR_LEN("jpeg")) { mime_fill(out, STR_PTR("image/jpeg"), STR_LEN("image/jpeg")); return; };
+        if ext_eq(path, path_len, dot, STR_PTR("gif"), STR_LEN("gif")) { mime_fill(out, STR_PTR("image/gif"), STR_LEN("image/gif")); return; };
+        if ext_eq(path, path_len, dot, STR_PTR("svg"), STR_LEN("svg")) { mime_fill(out, STR_PTR("image/svg+xml"), STR_LEN("image/svg+xml")); return; };
+        if ext_eq(path, path_len, dot, STR_PTR("ico"), STR_LEN("ico")) { mime_fill(out, STR_PTR("image/x-icon"), STR_LEN("image/x-icon")); return; };
+        if ext_eq(path, path_len, dot, STR_PTR("wasm"), STR_LEN("wasm")) { mime_fill(out, STR_PTR("application/wasm"), STR_LEN("application/wasm")); return; };
+        if ext_eq(path, path_len, dot, STR_PTR("xml"), STR_LEN("xml")) { mime_fill(out, STR_PTR("application/xml"), STR_LEN("application/xml")); return; };
+        if ext_eq(path, path_len, dot, STR_PTR("pdf"), STR_LEN("pdf")) { mime_fill(out, STR_PTR("application/pdf"), STR_LEN("application/pdf")); return; };
+    };
+    mime_fill(out, STR_PTR("application/octet-stream"), STR_LEN("application/octet-stream"));
+}
+
+// Compare a filled MimeType with a literal (test helper).
+fn mime_text_eq(m: &MimeType, lit: ptr, lit_len: u64) -> bool {
+    if m.len != lit_len {
+        return false;
+    };
+    let base: ptr = PTR_BYTE_ADD(&m.bytes, 0);
+    let i: u64 = 0;
+    while i < lit_len {
+        if PTR_BYTE_AT(base, i) != PTR_BYTE_AT(lit, i) {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}

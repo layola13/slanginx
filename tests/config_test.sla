@@ -1,0 +1,37 @@
+// Unit tests for the code layer (config.sla): deny rule, assets
+// alias routing, and the ip.sla-backed ACL predicate.
+// Run from the repo root:
+//   sa test tests/config_test.sla
+
+@import "../src/config.sla"
+@import "sa_std/string.sa"
+
+@test "deny rule covers internal and its children only"() {
+    if config_path_denied(STR_PTR("internal"), STR_LEN("internal")) { } else { panic(201); };
+    if config_path_denied(STR_PTR("internal/secret.txt"), STR_LEN("internal/secret.txt")) { } else { panic(202); };
+    if config_path_denied(STR_PTR("index.html"), STR_LEN("index.html")) { panic(203); };
+    if config_path_denied(STR_PTR("internalized/x"), STR_LEN("internalized/x")) { panic(204); };
+}
+
+@test "assets route matches the alias prefix only"() {
+    if config_route_is_assets(STR_PTR("assets"), STR_LEN("assets")) { } else { panic(211); };
+    if config_route_is_assets(STR_PTR("assets/logo.txt"), STR_LEN("assets/logo.txt")) { } else { panic(212); };
+    if config_route_is_assets(STR_PTR("assetsx/logo.txt"), STR_LEN("assetsx/logo.txt")) { panic(213); };
+    if config_route_is_assets(STR_PTR("index.html"), STR_LEN("index.html")) { panic(214); };
+}
+
+@test "assets root is the code-layer constant"() {
+    let r = config_assets_root();
+    if r.len != 10 { panic(221); };
+    if r.bytes[0] != 119 { panic(222); };
+}
+
+@test "acl refuses RFC1918 and unparseable input, allows public"() {
+    if config_acl_allows("8.8.8.8") { } else { panic(231); };
+    if config_acl_allows("10.1.2.3") { panic(232); };
+    if config_acl_allows("172.16.5.4") { panic(233); };
+    if config_acl_allows("172.31.255.255") { panic(234); };
+    if config_acl_allows("172.32.0.1") { } else { panic(235); };
+    if config_acl_allows("192.168.1.1") { panic(236); };
+    if config_acl_allows("not-an-ip") { panic(237); };
+}

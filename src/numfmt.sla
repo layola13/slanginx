@@ -1,0 +1,32 @@
+// numfmt: minimal unsigned-integer decimal formatting for slanginx.
+// Produces text into a small owned struct so callers never have to
+// return a string constant across a unit boundary.
+
+struct DecText {
+    bytes: [u8; 20],
+    len: u64,
+}
+
+fn dec_u64(v: u64) -> DecText {
+    let t = DecText { bytes: [0u8; 20], len: 0 };
+    if v == 0 {
+        t.bytes[0] = 48;
+        t.len = 1;
+        return t;
+    };
+    let tmp: [u8; 20] = [0u8; 20];
+    let n: u64 = 0;
+    let x: u64 = v;
+    while x > 0 {
+        tmp[n] = 48 + (x % 10) as u8;
+        n = n + 1;
+        x = x / 10;
+    }
+    let i: u64 = 0;
+    while i < n {
+        t.bytes[i] = tmp[n - 1 - i];
+        i = i + 1;
+    }
+    t.len = n;
+    return t;
+}

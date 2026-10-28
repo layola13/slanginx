@@ -1,0 +1,75 @@
+// Unit tests for webpath: decoding, normalization, traversal
+// containment, MIME. Run from the repo root:
+//   sa test tests/webpath_test.sla
+
+@import "../src/webpath.sla"
+@import "sa_std/string.sa"
+
+@test "root path resolves to empty with slash flag"() {
+    let r = resolved_new();
+    let rc: i32 = webpath_resolve(STR_PTR("/"), STR_LEN("/"), &r);
+    if rc != 0 { panic(101); };
+    if r.len != 0 { panic(102); };
+    if r.ended_with_slash { } else { panic(103); };
+}
+
+@test "plain path normalizes without leading slash"() {
+    let r = resolved_new();
+    let rc: i32 = webpath_resolve(STR_PTR("/a/b.txt"), STR_LEN("/a/b.txt"), &r);
+    if rc != 0 { panic(111); };
+    if resolved_text_eq(&r, STR_PTR("a/b.txt"), STR_LEN("a/b.txt")) { } else { panic(112); };
+    if r.ended_with_slash { panic(113); };
+}
+
+@test "dot segments collapse inside the root"() {
+    let r = resolved_new();
+    let rc: i32 = webpath_resolve(STR_PTR("/a/./b/../c"), STR_LEN("/a/./b/../c"), &r);
+    if rc != 0 { panic(121); };
+    if resolved_text_eq(&r, STR_PTR("a/c"), STR_LEN("a/c")) { } else { panic(122); };
+}
+
+@test "traversal above the root is reported, not clamped"() {
+    let r = resolved_new();
+    let rc: i32 = webpath_resolve(STR_PTR("/../etc/passwd"), STR_LEN("/../etc/passwd"), &r);
+    if rc != 1 { panic(131); };
+    let r2 = resolved_new();
+    let rc2: i32 = webpath_resolve(STR_PTR("/a/../../x"), STR_LEN("/a/../../x"), &r2);
+    if rc2 != 1 { panic(132); };
+}
+
+@test "percent-encoded traversal is decoded then contained"() {
+    let r = resolved_new();
+    let rc: i32 = webpath_resolve(STR_PTR("/%2e%2e/secret.txt"), STR_LEN("/%2e%2e/secret.txt"), &r);
+    if rc != 1 { panic(141); };
+    let r2 = resolved_new();
+    let rc2: i32 = webpath_resolve(STR_PTR("/%2E%2E%2Fsecret.txt"), STR_LEN("/%2E%2E%2Fsecret.txt"), &r2);
+    if rc2 != 1 { panic(142); };
+}
+
+@test "query string is cut before resolution"() {
+    let r = resolved_new();
+    let rc: i32 = webpath_resolve(STR_PTR("/hello.txt?x=1&y=2"), STR_LEN("/hello.txt?x=1&y=2"), &r);
+    if rc != 0 { panic(151); };
+    if resolved_text_eq(&r, STR_PTR("hello.txt"), STR_LEN("hello.txt")) { } else { panic(152); };
+}
+
+@test "bad percent escape and decoded NUL are malformed"() {
+    let r = resolved_new();
+    let rc: i32 = webpath_resolve(STR_PTR("/a%zz"), STR_LEN("/a%zz"), &r);
+    if rc != 2 { panic(161); };
+    let r2 = resolved_new();
+    let rc2: i32 = webpath_resolve(STR_PTR("/a%00b"), STR_LEN("/a%00b"), &r2);
+    if rc2 != 2 { panic(162); };
+}
+
+@test "mime by extension, case folded, octet-stream default"() {
+    let m = mime_new();
+    webpath_mime(STR_PTR("www/index.html"), STR_LEN("www/index.html"), &m);
+    if mime_text_eq(&m, STR_PTR("text/html"), STR_LEN("text/html")) { } else { panic(171); };
+    webpath_mime(STR_PTR("www/STYLE.CSS"), STR_LEN("www/STYLE.CSS"), &m);
+    if mime_text_eq(&m, STR_PTR("text/css"), STR_LEN("text/css")) { } else { panic(172); };
+    webpath_mime(STR_PTR("www/blob.bin"), STR_LEN("www/blob.bin"), &m);
+    if mime_text_eq(&m, STR_PTR("application/octet-stream"), STR_LEN("application/octet-stream")) { } else { panic(173); };
+    webpath_mime(STR_PTR("www/noext"), STR_LEN("www/noext"), &m);
+    if mime_text_eq(&m, STR_PTR("application/octet-stream"), STR_LEN("application/octet-stream")) { } else { panic(174); };
+}

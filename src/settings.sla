@@ -1,0 +1,230 @@
+// settings: the declarative (TOML) layer of slanginx configuration.
+//
+// The operator edits slanginx.toml and restarts; no recompilation.
+// Fields that are absent keep the built-in defaults below. A field
+// that is present with the wrong type is a startup error, reported
+// by key -- the load-time, located-error behavior the two-layer
+// design calls for (no silent coercion, no silent fallback).
+//
+// All text fields are stored as fixed byte arrays + lengths, never
+// as String: a struct with several String fields is a known SAB
+// referee hazard in the current toolchain, and this shape is the
+// proven-safe one (integer/array fields only).
+//
+// TOML layout:
+//   [server]
+//   host = "127.0.0.1"          (string)
+//   port = 8080                 (integer)
+//   root = "www"                (string)
+//   index = "index.html"        (string)
+//   access_log = "logs/access.log" (string)
+//   max_file_bytes = 33554432   (integer)
+
+@import "sa_std/encoding/toml.sla"
+@import "sa_std/fs.sai"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+
+struct Settings {
+    host: [u8; 64],
+    host_len: u64,
+    port: u16,
+    root: [u8; 512],
+    root_len: u64,
+    index: [u8; 128],
+    index_len: u64,
+    log_path: [u8; 512],
+    log_len: u64,
+    max_file_bytes: u64,
+}
+
+// settings_load result codes:
+//   0 = file loaded and applied
+//   1 = no readable config file (defaults kept; caller decides)
+//   2 = TOML parse error
+//   3 = a present key has the wrong type or an out-of-range value
+
+fn copy_lit_host(s: &Settings, lit: ptr, lit_len: u64) {
+    let i: u64 = 0;
+    while i < lit_len {
+        s.host[i] = PTR_BYTE_AT(lit, i);
+        i = i + 1;
+    }
+    s.host_len = lit_len;
+}
+
+fn copy_lit_root(s: &Settings, lit: ptr, lit_len: u64) {
+    let i: u64 = 0;
+    while i < lit_len {
+        s.root[i] = PTR_BYTE_AT(lit, i);
+        i = i + 1;
+    }
+    s.root_len = lit_len;
+}
+
+fn copy_lit_index(s: &Settings, lit: ptr, lit_len: u64) {
+    let i: u64 = 0;
+    while i < lit_len {
+        s.index[i] = PTR_BYTE_AT(lit, i);
+        i = i + 1;
+    }
+    s.index_len = lit_len;
+}
+
+fn copy_lit_log(s: &Settings, lit: ptr, lit_len: u64) {
+    let i: u64 = 0;
+    while i < lit_len {
+        s.log_path[i] = PTR_BYTE_AT(lit, i);
+        i = i + 1;
+    }
+    s.log_len = lit_len;
+}
+
+fn settings_blank() -> Settings {
+    let s = Settings {
+        host: [0u8; 64], host_len: 0, port: 8080,
+        root: [0u8; 512], root_len: 0,
+        index: [0u8; 128], index_len: 0,
+        log_path: [0u8; 512], log_len: 0,
+        max_file_bytes: 33554432,
+    };
+    copy_lit_host(&s, STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1"));
+    copy_lit_root(&s, STR_PTR("www"), STR_LEN("www"));
+    copy_lit_index(&s, STR_PTR("index.html"), STR_LEN("index.html"));
+    copy_lit_log(&s, STR_PTR("logs/access.log"), STR_LEN("logs/access.log"));
+    return s;
+}
+
+// Apply one string key into the field selected by `tag`
+// (0=host, 1=root, 2=index, 3=log_path). Returns 0 ok / 3 type error.
+// A missing key is not an error: the default stays.
+fn apply_string_key(s: &Settings, doc: u64, path: ptr, path_len: u64, tag: u32, cap: u64) -> i32 {
+    let kind: u32 = 0;
+    let st: i32 = sa_toml_kind(doc, path, path_len, &kind);
+    if st != 0 {
+        return 0;
+    };
+    if kind != SA_TOML_KIND_STRING {
+        return 3;
+    };
+    let v_ptr: ptr = PTR_NULL();
+    let v_len: u64 = 0;
+    let gst: i32 = sa_toml_get_string(doc, path, path_len, &v_ptr, &v_len);
+    if gst != 0 {
+        return 3;
+    };
+    if v_len > cap {
+        return 3;
+    };
+    if tag == 0 {
+        let i: u64 = 0;
+        while i < v_len {
+            s.host[i] = PTR_BYTE_AT(v_ptr, i);
+            i = i + 1;
+        }
+        s.host_len = v_len;
+        return 0;
+    };
+    if tag == 1 {
+        let i: u64 = 0;
+        while i < v_len {
+            s.root[i] = PTR_BYTE_AT(v_ptr, i);
+            i = i + 1;
+        }
+        s.root_len = v_len;
+        return 0;
+    };
+    if tag == 2 {
+        let i: u64 = 0;
+        while i < v_len {
+            s.index[i] = PTR_BYTE_AT(v_ptr, i);
+            i = i + 1;
+        }
+        s.index_len = v_len;
+        return 0;
+    };
+    let i: u64 = 0;
+    while i < v_len {
+        s.log_path[i] = PTR_BYTE_AT(v_ptr, i);
+        i = i + 1;
+    }
+    s.log_len = v_len;
+    return 0;
+}
+
+fn settings_load(s: &Settings, cfg_ptr: ptr, cfg_len: u64) -> i32 {
+    let handle: u64 = 0;
+    let rst: i32 = sa_std_fs_read_file(cfg_ptr, cfg_len, 65536, &handle);
+    if rst != 0 {
+        return 1;
+    };
+    let data: ptr = sa_fs_read_buffer_data(handle);
+    let dlen: u64 = sa_fs_read_buffer_len(handle);
+    let doc: u64 = sa_toml_parse(data, dlen);
+    if doc == 0 {
+        sa_fs_read_buffer_free(handle);
+        return 2;
+    };
+    let rc: i32 = 0;
+    rc = apply_string_key(s, doc, STR_PTR("server.host"), STR_LEN("server.host"), 0, 64);
+    if rc == 0 {
+        rc = apply_string_key(s, doc, STR_PTR("server.root"), STR_LEN("server.root"), 1, 512);
+    };
+    if rc == 0 {
+        rc = apply_string_key(s, doc, STR_PTR("server.index"), STR_LEN("server.index"), 2, 128);
+    };
+    if rc == 0 {
+        rc = apply_string_key(s, doc, STR_PTR("server.access_log"), STR_LEN("server.access_log"), 3, 512);
+    };
+    if rc == 0 {
+        // port: optional integer in 1..65535
+        let kind: u32 = 0;
+        let st: i32 = sa_toml_kind(doc, STR_PTR("server.port"), STR_LEN("server.port"), &kind);
+        if st == 0 {
+            if kind != SA_TOML_KIND_INTEGER {
+                rc = 3;
+            } else {
+                let v: i64 = 0;
+                let gst: i32 = sa_toml_get_i64(doc, STR_PTR("server.port"), STR_LEN("server.port"), &v);
+                if gst != 0 {
+                    rc = 3;
+                } else {
+                    if v < 1 {
+                        rc = 3;
+                    } else {
+                        if v > 65535 {
+                            rc = 3;
+                        } else {
+                            s.port = v as u16;
+                        };
+                    };
+                };
+            };
+        };
+    };
+    if rc == 0 {
+        // max_file_bytes: optional positive integer
+        let kind: u32 = 0;
+        let st: i32 = sa_toml_kind(doc, STR_PTR("server.max_file_bytes"), STR_LEN("server.max_file_bytes"), &kind);
+        if st == 0 {
+            if kind != SA_TOML_KIND_INTEGER {
+                rc = 3;
+            } else {
+                let v: i64 = 0;
+                let gst: i32 = sa_toml_get_i64(doc, STR_PTR("server.max_file_bytes"), STR_LEN("server.max_file_bytes"), &v);
+                if gst != 0 {
+                    rc = 3;
+                } else {
+                    if v < 1 {
+                        rc = 3;
+                    } else {
+                        s.max_file_bytes = v as u64;
+                    };
+                };
+            };
+        };
+    };
+    sa_toml_free(doc);
+    sa_fs_read_buffer_free(handle);
+    return rc;
+}
