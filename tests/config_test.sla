@@ -3,7 +3,7 @@
 // Run from the repo root:
 //   sa test tests/config_test.sla
 
-@import "../src/config.sla"
+@import "src/config.sla"
 @import "sa_std/string.sa"
 
 @test "deny rule covers internal and its children only"() {
@@ -27,11 +27,11 @@
 }
 
 @test "acl refuses RFC1918 and unparseable input, allows public"() {
-    if config_acl_allows("8.8.8.8") { } else { panic(231); };
-    if config_acl_allows("10.1.2.3") { panic(232); };
-    if config_acl_allows("172.16.5.4") { panic(233); };
-    if config_acl_allows("172.31.255.255") { panic(234); };
-    if config_acl_allows("172.32.0.1") { } else { panic(235); };
-    if config_acl_allows("192.168.1.1") { panic(236); };
-    if config_acl_allows("not-an-ip") { panic(237); };
+    if config_acl_allows(format("8.8.8.8")) { } else { panic(231); };
+    if config_acl_allows(format("10.1.2.3")) { panic(232); };
+    if config_acl_allows(format("172.16.5.4")) { panic(233); };
+    if config_acl_allows(format("172.31.255.255")) { panic(234); };
+    if config_acl_allows(format("172.32.0.1")) { } else { panic(235); };
+    if config_acl_allows(format("192.168.1.1")) { panic(236); };
+    if config_acl_allows(format("not-an-ip")) { panic(237); };
 }

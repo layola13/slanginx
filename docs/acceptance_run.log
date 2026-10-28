@@ -1,0 +1,59 @@
+=== run 1: shipped slanginx.toml (port 18090, root www) ===
+server pid 108671
+PASS GET /hello.txt 200 byte-exact
+PASS GET / serves index.html
+PASS GET /blob.bin byte-exact (sha256 c8f5d0341d54d951 == c8f5d0341d54d951)
+PASS blob.bin content-type octet-stream
+PASS style.css content-type text/css
+PASS HEAD /hello.txt 200
+PASS HEAD content-type text/plain
+PASS HEAD response carries no body bytes
+PASS GET /missing.txt 404
+PASS GET /../slanginx.toml blocked (403)
+PASS GET /%2e%2e/slanginx.toml blocked (403)
+PASS GET /a/../../slanginx.toml blocked (403)
+PASS GET /internal/secret.txt 403 (code-layer deny, file exists on disk)
+PASS GET /assets/logo.txt served from alt root (code-layer alias)
+PASS GET /assets/only-here.txt 200 (exists only in alt root)
+PASS GET /assets/ serves alt root index
+PASS GET /big.txt 200 byte-exact (buffered path)
+PASS POST 405
+--- run 1 server log:
+slanginx: listening (address and root from config)
+--- run 1 access log:
+- GET /hello.txt 200 32 "curl/8.5.0"
+- GET /hello.txt 200 32 "curl/8.5.0"
+- GET / 200 165 "curl/8.5.0"
+- GET /blob.bin 200 4096 "curl/8.5.0"
+- GET /style.css 200 20 "curl/8.5.0"
+- HEAD /hello.txt 200 0 "curl/8.5.0"
+- HEAD /hello.txt 200 0 "-"
+- GET /missing.txt 404 10 "curl/8.5.0"
+- GET /../slanginx.toml 403 10 "curl/8.5.0"
+- GET /%2e%2e/slanginx.toml 403 10 "curl/8.5.0"
+- GET /a/../../slanginx.toml 403 10 "curl/8.5.0"
+- GET /internal/secret.txt 403 10 "curl/8.5.0"
+- GET /assets/logo.txt 200 47 "curl/8.5.0"
+- GET /assets/only-here.txt 200 46 "curl/8.5.0"
+- GET /assets/ 200 69 "curl/8.5.0"
+- GET /big.txt 200 210000 "slanginx-acceptance/1.0"
+- POST /hello.txt 405 19 "curl/8.5.0"
+PASS access log: hello.txt 200 32 bytes
+PASS access log: missing.txt 404 10 bytes
+PASS access log: secret.txt 403
+PASS access log: user-agent recorded
+PASS access log: big.txt 200 210000 bytes
+=== run 2: alt TOML port 18091, max_file_bytes=1024 (streaming path) ===
+server pid 108724
+PASS run2 GET /big.txt 200 byte-exact over streaming path (cap 1024)
+PASS run2 GET /blob.bin byte-exact over streaming path
+PASS run2 GET /hello.txt 200 on new port (TOML port change live)
+--- run 2 server log:
+slanginx: listening (address and root from config)
+=== run 3: alt TOML port 18092, root www-assets (TOML root change) ===
+server pid 108740
+PASS run3 GET / serves www-assets/index.html (TOML root change live)
+PASS run3 GET /hello.txt 404 (not in new root)
+--- run 3 server log:
+slanginx: listening (address and root from config)
+=== acceptance done: FAIL count = 0 ===

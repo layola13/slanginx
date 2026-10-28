@@ -2,7 +2,7 @@
 // containment, MIME. Run from the repo root:
 //   sa test tests/webpath_test.sla
 
-@import "../src/webpath.sla"
+@import "src/webpath.sla"
 @import "sa_std/string.sa"
 
 @test "root path resolves to empty with slash flag"() {

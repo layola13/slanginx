@@ -160,7 +160,7 @@ fn webpath_resolve(raw: ptr, raw_len: u64, out: &ResolvedPath) -> i32 {
         if dec.bytes[dec.len - 1] == 47 {
             out.ended_with_slash = true;
         };
-    }
+    };
     // 3. Dot-segment processing over the decoded path.
     out.len = 0;
     let seg: u64 = 0;
@@ -272,8 +272,14 @@ fn mime_new() -> MimeType {
 }
 
 fn mime_fill(out: &MimeType, lit: ptr, lit_len: u64) {
-    let dst: ptr = PTR_BYTE_ADD(&out.bytes, 0);
-    PTR_COPY_BYTES(dst, lit, lit_len);
+    // Byte loop, not PTR_COPY_BYTES: the macro's expansion traps
+    // SAB-direct lowering (UnknownRegister 1007) when it appears in
+    // an imported .sla unit -- minimal repro in docs/M0_DELIVERY.md.
+    let i: u64 = 0;
+    while i < lit_len {
+        out.bytes[i] = PTR_BYTE_AT(lit, i);
+        i = i + 1;
+    }
     out.len = lit_len;
 }
 

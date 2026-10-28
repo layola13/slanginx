@@ -74,41 +74,58 @@ fn config_path_denied(norm: ptr, norm_len: u64) -> bool {
 // `prefix_text`? Unparseable table text denies nothing (returns
 // false) -- table entries are compile-time constants below, and
 // the unit tests pin their behavior.
+//
+// Option values are unwrapped into pre-initialized locals (the
+// idiom of sa_std's own ip tests). Callers must pass format(...)
+// built Strings: a bare string literal handed to a String
+// parameter segfaults inside ip.sla under the current SAB test
+// path (the literal/String representation split) -- repro
+// registered in docs/M0_DELIVERY.md.
 fn acl_entry_matches(prefix_text: String, addr: IpAddr) -> bool {
+    let prefix: IpPrefix = ip_prefix_from(ip_addr_from_ipv4(0), 0);
+    let ok: bool = false;
     let parsed = ip_prefix_parse(prefix_text);
-    let hit: bool = false;
     match parsed {
-        Some(prefix) => {
-            hit = ip_prefix_contains_addr(prefix, addr);
+        Some(v) => {
+            prefix = v;
+            ok = true;
         },
         None => {
-            hit = false;
+            ok = false;
         }
-    }
-    return hit;
+    };
+    if !ok {
+        return false;
+    };
+    return ip_prefix_contains_addr(prefix, addr);
 }
 
 // Code-layer ACL: RFC1918 private networks are refused; anything
 // else parseable is allowed; unparseable input is refused.
 fn config_acl_allows(ip_text: String) -> bool {
+    let addr: IpAddr = ip_addr_from_ipv4(0);
+    let ok: bool = false;
     let parsed = ip_addr_parse(ip_text);
-    let allowed: bool = false;
     match parsed {
-        Some(addr) => {
-            allowed = true;
-            if acl_entry_matches("10.0.0.0/8", addr) {
-                allowed = false;
-            };
-            if acl_entry_matches("172.16.0.0/12", addr) {
-                allowed = false;
-            };
-            if acl_entry_matches("192.168.0.0/16", addr) {
-                allowed = false;
-            };
+        Some(v) => {
+            addr = v;
+            ok = true;
         },
         None => {
-            allowed = false;
+            ok = false;
         }
-    }
-    return allowed;
+    };
+    if !ok {
+        return false;
+    };
+    if acl_entry_matches(format("10.0.0.0/8"), addr) {
+        return false;
+    };
+    if acl_entry_matches(format("172.16.0.0/12"), addr) {
+        return false;
+    };
+    if acl_entry_matches(format("192.168.0.0/16"), addr) {
+        return false;
+    };
+    return true;
 }

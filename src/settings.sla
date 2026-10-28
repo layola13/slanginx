@@ -20,6 +20,7 @@
 //   access_log = "logs/access.log" (string)
 //   max_file_bytes = 33554432   (integer)
 
+@import "sa_std/encoding/toml.sai"
 @import "sa_std/encoding/toml.sla"
 @import "sa_std/fs.sai"
 @import "sa_std/ptr.sa"

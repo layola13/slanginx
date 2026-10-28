@@ -144,7 +144,7 @@ fn handle_request(req: ptr, s: &Settings) -> Outcome {
             };
             return o;
         };
-    }
+    };
     // --- path resolution (decode + normalize + containment) ---
     let resolved = resolved_new();
     let rrc: i32 = webpath_resolve(p_ptr, p_len, &resolved);
@@ -252,26 +252,32 @@ fn handle_request(req: ptr, s: &Settings) -> Outcome {
             o.body_bytes = send_simple(req, 404, STR_PTR("not found\n"), STR_LEN("not found\n"));
             return o;
         };
-        cand_len = cand_len;
     };
     // --- content type by extension ---
     let mime = mime_new();
     webpath_mime(cand_ptr, cand_len, &mime);
     let mime_ptr: ptr = PTR_BYTE_ADD(&mime.bytes, 0);
-    // --- HEAD: headers only ---
+    // --- HEAD: headers only, no body bytes on the wire ---
+    // The std server face offers no shape that emits a HEAD
+    // response carrying the resource's content-length (all three
+    // candidates measured on the wire, see docs/M0_DELIVERY.md):
+    // resp_send_v2 overrides a caller-set content-length with the
+    // body length; passing the real body makes it emit the body
+    // bytes for a HEAD request (protocol violation); the stream
+    // face drops the caller content-length and frames chunked.
+    // Chunked + no body is the only protocol-valid option, so
+    // HEAD answers 200 + content-type with an empty chunked body
+    // until the std face grows a header-only response shape.
     if is_head {
         let resp: ptr = PTR_NULL();
         o.status = 200;
-        if sa_http_server_resp_new_v2(req, 200, &resp) != 0 {
+        if sa_http_server_resp_stream_new_v2(req, 200, &resp) != 0 {
             o.status = 500;
             return o;
         };
-        sa_http_server_resp_add_header_v2(resp, STR_PTR("content-type"), STR_LEN("content-type"), mime_ptr, mime.len);
-        let d = dec_u64(file_len);
-        let d_ptr: ptr = PTR_BYTE_ADD(&d.bytes, 0);
-        sa_http_server_resp_add_header_v2(resp, STR_PTR("content-length"), STR_LEN("content-length"), d_ptr, d.len);
-        sa_http_server_resp_send_v2(resp, STR_PTR(""), STR_LEN(""), 5000);
-        sa_http_server_resp_free_v2(resp);
+        sa_http_server_resp_stream_add_header_v2(resp, STR_PTR("content-type"), STR_LEN("content-type"), mime_ptr, mime.len);
+        sa_http_server_resp_stream_end_v2(resp, 5000);
+        sa_http_server_resp_stream_free_v2(resp);
         o.body_bytes = 0;
         return o;
     };
@@ -344,32 +350,53 @@ fn handle_request(req: ptr, s: &Settings) -> Outcome {
     return o;
 }
 
-fn print_bytes(p: ptr, n: u64) {
-    sa_print_bytes(p, n);
+struct ConfigPath {
+    bytes: [u8; 512],
+    len: u64,
+}
+
+// Read $SLANGINX_CONFIG into a fixed buffer. Guard-return shape
+// throughout: the env buffer handle is freed on the single path
+// that created it and never crosses a control-flow merge (a
+// conditional free + merge traps with PhiStateConflict).
+fn env_config_path() -> ConfigPath {
+    let cp = ConfigPath { bytes: [0u8; 512], len: 0 };
+    if sa_env_has(STR_PTR("SLANGINX_CONFIG"), STR_LEN("SLANGINX_CONFIG")) != 0 {
+        return cp;
+    };
+    let eb: u64 = sa_env_get(STR_PTR("SLANGINX_CONFIG"), STR_LEN("SLANGINX_CONFIG"));
+    if eb == 0 {
+        return cp;
+    };
+    let ep: ptr = sa_env_buffer_data(eb);
+    let el: u64 = sa_env_buffer_len(eb);
+    let i: u64 = 0;
+    while i < el {
+        if i < 512 {
+            cp.bytes[i] = PTR_BYTE_AT(ep, i);
+        };
+        i = i + 1;
+    }
+    cp.len = el;
+    if cp.len > 512 {
+        cp.len = 512;
+    };
+    sa_env_buffer_free(eb);
+    return cp;
 }
 
 fn main() -> i32 {
     // --- locate the TOML config: $SLANGINX_CONFIG or ./slanginx.toml ---
+    let from_env = env_config_path();
     let cfg_buf: [u8; 512] = [0u8; 512];
     let cfg_len: u64 = 0;
-    if sa_env_has(STR_PTR("SLANGINX_CONFIG"), STR_LEN("SLANGINX_CONFIG")) == 0 {
-        let eb: u64 = sa_env_get(STR_PTR("SLANGINX_CONFIG"), STR_LEN("SLANGINX_CONFIG"));
-        if eb != 0 {
-            let ep: ptr = sa_env_buffer_data(eb);
-            let el: u64 = sa_env_buffer_len(eb);
-            let i: u64 = 0;
-            while i < el {
-                if i < 512 {
-                    cfg_buf[i] = PTR_BYTE_AT(ep, i);
-                };
-                i = i + 1;
-            }
-            cfg_len = el;
-            if cfg_len > 512 {
-                cfg_len = 512;
-            };
-            sa_env_buffer_free(eb);
-        };
+    if from_env.len > 0 {
+        let i: u64 = 0;
+        while i < from_env.len {
+            cfg_buf[i] = from_env.bytes[i];
+            i = i + 1;
+        }
+        cfg_len = from_env.len;
     };
     if cfg_len == 0 {
         let lit: ptr = STR_PTR("slanginx.toml");
@@ -386,44 +413,41 @@ fn main() -> i32 {
     let s = settings_blank();
     let lrc: i32 = settings_load(&s, cfg_ptr, cfg_len);
     if lrc == 2 {
-        print_bytes(STR_PTR("slanginx: TOML parse error in config file\n"), STR_LEN("slanginx: TOML parse error in config file\n"));
+        println("slanginx: TOML parse error in config file");
         return 2;
     };
     if lrc == 3 {
-        print_bytes(STR_PTR("slanginx: config key has wrong type or out-of-range value\n"), STR_LEN("slanginx: config key has wrong type or out-of-range value\n"));
+        println("slanginx: config key has wrong type or out-of-range value");
         return 2;
     };
     if lrc == 1 {
-        print_bytes(STR_PTR("slanginx: no config file found, using built-in defaults\n"), STR_LEN("slanginx: no config file found, using built-in defaults\n"));
+        println("slanginx: no config file found, using built-in defaults");
     };
     // --- the access log must be openable at boot (fail fast) ---
     let log_ptr: ptr = PTR_BYTE_ADD(&s.log_path, 0);
     if access_log_probe(log_ptr, s.log_len) != 0 {
-        print_bytes(STR_PTR("slanginx: cannot open access log for append\n"), STR_LEN("slanginx: cannot open access log for append\n"));
+        println("slanginx: cannot open access log for append");
         return 2;
     };
     // --- server up ---
     let srv: ptr = PTR_NULL();
     if sa_http_server_new_v2(&srv) != 0 {
-        print_bytes(STR_PTR("slanginx: server create failed\n"), STR_LEN("slanginx: server create failed\n"));
+        println("slanginx: server create failed");
         return 3;
     };
     let host_ptr: ptr = PTR_BYTE_ADD(&s.host, 0);
     if sa_http_server_start_v2(srv, host_ptr, s.host_len, s.port) != 0 {
-        print_bytes(STR_PTR("slanginx: server bind failed\n"), STR_LEN("slanginx: server bind failed\n"));
+        println("slanginx: server bind failed");
         return 3;
     };
-    let banner = logline_new();
-    logline_push(&banner, STR_PTR("slanginx: listening on "), STR_LEN("slanginx: listening on "));
-    logline_push(&banner, host_ptr, s.host_len);
-    logline_push_byte(&banner, 58);
-    logline_push_dec(&banner, s.port as u64);
-    logline_push(&banner, STR_PTR(" root="), STR_LEN(" root="));
-    let root_ptr: ptr = PTR_BYTE_ADD(&s.root, 0);
-    logline_push(&banner, root_ptr, s.root_len);
-    logline_push_byte(&banner, 10);
-    let banner_ptr: ptr = PTR_BYTE_ADD(&banner.bytes, 0);
-    print_bytes(banner_ptr, banner.len);
+    // Banner: static text only, via println. Calling the
+    // sa_print_bytes extern directly traps CapabilityMismatch in
+    // the current toolchain even with literal arguments (its
+    // &msg capability contract is only satisfied through the
+    // println path) -- repro registered in docs/M0_DELIVERY.md.
+    // The effective listen address is the config's; the
+    // acceptance harness verifies it over HTTP.
+    println("slanginx: listening (address and root from config)");
     // --- accept loop ---
     let spinning: bool = true;
     while spinning {
