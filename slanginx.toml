@@ -11,3 +11,23 @@ root = "www"
 index = "index.html"
 access_log = "logs/access.log"
 max_file_bytes = 33554432
+
+# Shared dict zones (M1, docs/HANDLER_MODEL.md model A): the only
+# cross-request state in the server. Declared here, reached from
+# the code layer only through the dict API. "stats" carries the
+# reverse proxy's per-upstream counters, read back at
+# GET /__slanginx/status.
+[shared_dict.0]
+name = "stats"
+capacity = 1024
+
+# Reverse proxy (M1): upstream pools and prefix routes. A route
+# forwards the full normalized path to its pool, round-robin,
+# with failover to the next server on transport errors.
+# [upstream.0]
+# name = "api"
+# servers = "127.0.0.1:19001, 127.0.0.1:19002"
+#
+# [route.0]
+# prefix = "/api/"
+# upstream = "api"

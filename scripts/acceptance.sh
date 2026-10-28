@@ -80,6 +80,7 @@ grep -qi "^content-type: text/css" /tmp/r1_css.hdr && ok "style.css content-type
 curl -s -I --path-as-is $B/hello.txt > /tmp/r1_head.hdr
 grep -q "200" /tmp/r1_head.hdr && ok "HEAD /hello.txt 200" || bad "HEAD status: $(head -1 /tmp/r1_head.hdr)"
 grep -qi "^content-type: text/plain" /tmp/r1_head.hdr && ok "HEAD content-type text/plain" || bad "HEAD content-type"
+grep -qi "^content-length: 32" /tmp/r1_head.hdr && ok "HEAD content-length 32 (G1 head shape)" || bad "HEAD content-length: $(grep -i '^content-length' /tmp/r1_head.hdr)"
 # HEAD must not put body bytes on the wire (raw socket check).
 python3 - <<'PYEOF' && ok "HEAD response carries no body bytes" || bad "HEAD response carried body bytes"
 import socket, sys
@@ -135,6 +136,7 @@ stop_server "$PID" 18090
 echo "--- run 1 server log:"; cat /tmp/slanginx_run1.log
 echo "--- run 1 access log:"; cat logs/access.log
 grep -q "GET /hello.txt 200 32" logs/access.log && ok "access log: hello.txt 200 32 bytes" || bad "access log hello line"
+grep -q "^127.0.0.1 GET /hello.txt 200 32" logs/access.log && ok "access log: remote is the real peer (G2)" || bad "access log remote field"
 grep -q "GET /missing.txt 404 10" logs/access.log && ok "access log: missing.txt 404 10 bytes" || bad "access log 404 line"
 grep -q "GET /internal/secret.txt 403 10" logs/access.log && ok "access log: secret.txt 403" || bad "access log 403 line"
 grep -q "slanginx-acceptance/1.0" logs/access.log && ok "access log: user-agent recorded" || bad "access log UA missing"
@@ -186,6 +188,95 @@ got=$(curl -s --path-as-is -o /dev/null -w "%{http_code}" $B/hello.txt)
 [ "$got" = 404 ] && ok "run3 GET /hello.txt 404 (not in new root)" || bad "run3 GET /hello.txt ($got)"
 stop_server "$PID" 18092
 echo "--- run 3 server log:"; cat /tmp/slanginx_run3.log
+
+# ================= run 4 (M1 proxy) =================
+echo "=== run 4: reverse proxy (port 18093, upstreams 19001/19002, dead pool) ==="
+cat > /tmp/slanginx_proxy.toml <<'EOF'
+[server]
+host = "127.0.0.1"
+port = 18093
+root = "www"
+index = "index.html"
+access_log = "logs/proxy-access.log"
+max_file_bytes = 33554432
+
+[upstream.0]
+name = "api"
+servers = "127.0.0.1:19001, 127.0.0.1:19002"
+
+[upstream.1]
+name = "dead"
+servers = "127.0.0.1:19999"
+
+[route.0]
+prefix = "/api/"
+upstream = "api"
+
+[route.1]
+prefix = "/dead/"
+upstream = "dead"
+
+[shared_dict.0]
+name = "stats"
+capacity = 1024
+EOF
+rm -f logs/proxy-access.log
+setsid nohup python3 scripts/upstream_fixture.py 19001 A > /tmp/fixture_a.log 2>&1 &
+FA=$!
+setsid nohup python3 scripts/upstream_fixture.py 19002 B > /tmp/fixture_b.log 2>&1 &
+FB=$!
+curl -s --retry 20 --retry-connrefused --retry-delay 1 --retry-max-time 25 -o /dev/null http://127.0.0.1:19001/hello
+curl -s --retry 20 --retry-connrefused --retry-delay 1 --retry-max-time 25 -o /dev/null http://127.0.0.1:19002/hello
+wait_port_free 18093 || exit 98
+PID=$(start_server /tmp/slanginx_proxy.toml /tmp/slanginx_run4.log)
+echo "server pid $PID (fixtures $FA $FB)"
+B=http://127.0.0.1:18093
+
+got=$(first_get 18093 /api/hello /tmp/r4_h1)
+[ "$got" = "" ] && got=000
+grep -q "hello from upstream A" /tmp/r4_h1 && ok "proxy GET /api/hello -> upstream A (round-robin first pick)" || bad "proxy hello 1: $(cat /tmp/r4_h1)"
+curl -s --path-as-is -o /tmp/r4_h2 $B/api/hello
+grep -q "hello from upstream B" /tmp/r4_h2 && ok "proxy GET /api/hello -> upstream B (round-robin second pick)" || bad "proxy hello 2: $(cat /tmp/r4_h2)"
+
+curl -s --path-as-is -A "proxy-check/1.0" -H "Accept-Language: xx-accept" -o /tmp/r4_echo $B/api/echo?x=1
+grep -q "^method GET" /tmp/r4_echo && ok "proxy echo: method forwarded" || bad "proxy echo method: $(cat /tmp/r4_echo)"
+grep -q "^path /api/echo" /tmp/r4_echo && ok "proxy echo: full path forwarded (query not exposed by the server face, G4)" || bad "proxy echo path"
+grep -q "^x-forwarded-for 127.0.0.1" /tmp/r4_echo && ok "proxy echo: x-forwarded-for carries the peer (G2)" || bad "proxy echo xff"
+grep -q "^x-real-ip 127.0.0.1" /tmp/r4_echo && ok "proxy echo: x-real-ip carries the peer" || bad "proxy echo x-real-ip"
+grep -q "^accept-language xx-accept" /tmp/r4_echo && ok "proxy echo: accept-language forwarded" || bad "proxy echo accept-language"
+# NOTE: the echo's user-agent line shows the std client's own
+# default, not the client's UA -- add_header_v2("user-agent")
+# never reaches the wire (G5, docs/M1_DELIVERY.md). No check
+# asserts it until the client face honors the header.
+
+curl -s --path-as-is --data-binary "abc123xyz" -H "Content-Type: text/x-test" -o /tmp/r4_post $B/api/echo
+grep -q "^method POST" /tmp/r4_post && ok "proxy POST: method forwarded" || bad "proxy POST method"
+grep -q "^content-type text/x-test" /tmp/r4_post && ok "proxy POST: content-type forwarded" || bad "proxy POST content-type"
+grep -q "^abc123xyz$" /tmp/r4_post && ok "proxy POST: body forwarded byte-exact" || bad "proxy POST body: $(cat /tmp/r4_post)"
+
+got=$(curl -s --path-as-is -o /tmp/r4_404 -w "%{http_code}" $B/api/status404)
+[ "$got" = 404 ] && grep -q "says missing" /tmp/r4_404 && ok "proxy relays upstream 404 with its body" || bad "proxy 404 relay ($got)"
+
+curl -s -I --path-as-is $B/api/hello > /tmp/r4_head.hdr
+grep -qi "^content-length: 22" /tmp/r4_head.hdr && ok "proxy HEAD: upstream content-length preserved (G1 relay)" || bad "proxy HEAD content-length: $(grep -i '^content-length' /tmp/r4_head.hdr)"
+
+got=$(curl -s --path-as-is -o /tmp/r4_dead -w "%{http_code}" $B/dead/anything)
+[ "$got" = 502 ] && grep -q "bad gateway" /tmp/r4_dead && ok "proxy dead upstream -> explicit 502 bad gateway" || bad "proxy dead ($got): $(cat /tmp/r4_dead)"
+
+curl -s --path-as-is -o /tmp/r4_status1 $B/__slanginx/status
+grep -q "^slanginx status" /tmp/r4_status1 && ok "status route answers" || bad "status route: $(cat /tmp/r4_status1)"
+req1=$(grep "^upstream api " /tmp/r4_status1 | awk '{print $4}')
+grep -q "^upstream dead requests 1 errors 1" /tmp/r4_status1 && ok "status: dead pool counted 1 request 1 error (shared dict)" || bad "status dead line: $(grep '^upstream dead' /tmp/r4_status1)"
+curl -s --path-as-is -o /dev/null $B/api/hello
+curl -s --path-as-is -o /tmp/r4_status2 $B/__slanginx/status
+req2=$(grep "^upstream api " /tmp/r4_status2 | awk '{print $4}')
+[ -n "$req1" ] && [ -n "$req2" ] && [ "$req2" = "$((req1 + 1))" ] && ok "status: api requests increments per proxied request ($req1 -> $req2)" || bad "status api requests: $req1 -> $req2"
+
+stop_server "$PID" 18093
+kill "$FA" "$FB" 2>/dev/null
+echo "--- run 4 server log:"; cat /tmp/slanginx_run4.log
+echo "--- run 4 access log:"; cat logs/proxy-access.log
+grep -q "^127.0.0.1 GET /api/hello 200 22" logs/proxy-access.log && ok "proxy access log: real peer + upstream body bytes" || bad "proxy access log line"
 
 echo "=== acceptance done: FAIL count = $FAIL ==="
 exit $FAIL

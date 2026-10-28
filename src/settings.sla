@@ -25,6 +25,8 @@
 @import "sa_std/fs.sai"
 @import "sa_std/ptr.sa"
 @import "sa_std/string.sa"
+@import "upstream.sla"
+@import "shared_dict.sla"
 
 struct Settings {
     host: [u8; 64],
@@ -153,7 +155,7 @@ fn apply_string_key(s: &Settings, doc: u64, path: ptr, path_len: u64, tag: u32, 
     return 0;
 }
 
-fn settings_load(s: &Settings, cfg_ptr: ptr, cfg_len: u64) -> i32 {
+fn settings_load(s: &Settings, pc: &ProxyConfig, dz: &DictZones, cfg_ptr: ptr, cfg_len: u64) -> i32 {
     let handle: u64 = 0;
     let rst: i32 = sa_std_fs_read_file(cfg_ptr, cfg_len, 65536, &handle);
     if rst != 0 {
@@ -224,6 +226,15 @@ fn settings_load(s: &Settings, cfg_ptr: ptr, cfg_len: u64) -> i32 {
                 };
             };
         };
+    };
+    if rc == 0 {
+        // M1 declarative sections: upstream pools + proxy routes
+        // and shared dict zones, same error discipline (a bad
+        // declaration is a startup error, rc 3).
+        rc = proxyconf_fill(pc, doc);
+    };
+    if rc == 0 {
+        rc = dictzones_fill(dz, doc);
     };
     sa_toml_free(doc);
     sa_fs_read_buffer_free(handle);

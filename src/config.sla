@@ -20,12 +20,12 @@
 //   - requests under "assets/" are aliased to a different root
 //     directory (config_assets_root below).
 //
-// The ACL predicate (config_acl_allows) is compiled in and covered
-// by unit tests, but is NOT yet wired to live requests: the std
-// HTTP server face exposes no peer-address getter for a request
-// handle, so there is no client address to evaluate it against.
-// That gap is registered in docs/M0_DELIVERY.md; the predicate is
-// ready the day the getter exists.
+// The ACL predicate (config_acl_allows) is wired to live
+// requests since M1: the std HTTP server face now exposes the
+// peer address (sa_http_server_req_peer_addr_v2, the G2 fix),
+// the accept path converts it with peer_text_to_string below
+// and evaluates the predicate per request (denied -> 403 before
+// routing). Unit tests still pin the predicate itself.
 
 @import "sa_std/ip.sla"
 @import "sa_std/ptr.sa"
@@ -68,6 +68,21 @@ fn config_path_denied(norm: ptr, norm_len: u64) -> bool {
         return true;
     };
     return bytes_starts_with_lit(norm, norm_len, STR_PTR("internal/"), STR_LEN("internal/"));
+}
+
+// Build a String from raw bytes (the sa_std http_proxy.sla
+// idiom: one-byte collect + format accumulation). Used to hand
+// the peer address text to the String-typed ACL predicate.
+fn peer_text_to_string(p: ptr, n: u64) -> String {
+    let out: String = format("");
+    let i: u64 = 0;
+    while i < n {
+        let one: [u8; 1] = [PTR_BYTE_AT(p, i)];
+        let s: String = one.iter().collect<String>();
+        out = format("{}{}", out, s);
+        i = i + 1;
+    }
+    return out;
 }
 
 // One ACL table entry: is `addr` inside the prefix spelled by
