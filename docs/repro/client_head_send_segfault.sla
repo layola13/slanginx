@@ -1,0 +1,31 @@
+// REPRO (defect D6, sa_std HTTP client): a client HEAD request
+// segfaults the process inside sa_http_client_req_send_v2.
+// Minimal shape: v2 client + req_new_v2 with method code 5
+// (HEAD) + send. The test process dies with signal 11 before
+// any assertion runs; the same flow with method 1 (GET) passes
+// (see the M1 probe series in docs/M1_DELIVERY.md).
+//
+// Needs a HEAD-capable upstream on 127.0.0.1:19001, e.g.:
+//   python3 scripts/upstream_fixture.py 19001 A
+// Run from the repo root:
+//   sa test docs/repro/client_head_send_segfault.sla
+// (As with all test files here, run it from inside a tree where
+// sa_std import resolution works.)
+
+@import "sa_std/http_client.sai"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+
+@test "repro D6: client HEAD send only"() {
+    let client: ptr = PTR_NULL();
+    if sa_http_client_new_v2(0, STR_PTR(""), 0, &client) != 0 { panic(611); };
+    let ureq: ptr = PTR_NULL();
+    if sa_http_client_req_new_v2(client, 5, STR_PTR("http://127.0.0.1:19001/hello"), STR_LEN("http://127.0.0.1:19001/hello"), &ureq) != 0 { panic(612); };
+    sa_http_client_req_set_timeout_v2(ureq, 4000);
+    let uresp: ptr = PTR_NULL();
+    let st: u32 = sa_http_client_req_send_v2(ureq, &uresp);
+    if st != 0 { panic(613); };
+    sa_http_client_resp_free(uresp);
+    sa_http_client_req_free(ureq);
+    sa_http_client_free(client);
+}

@@ -1,0 +1,54 @@
+// REPRO (defect F1, sa_std HTTP client face): a process that
+// only runs the v2 HTTP client in a loop -- creating a request,
+// sending it, reading the body slice, and freeing BOTH handles
+// every iteration -- grows its RSS linearly with the iteration
+// count. Measured on the M1 bench box (fixture upstream on
+// 19001): RSS climbed ~70 MB -> ~739 MB across this test's
+// 8,000 iterations (~120-250 kB per request, sampled every
+// 0.5 s from /proc while `sa test` ran). The test itself
+// PASSES; the defect is visible only in the process's memory
+// footprint, which is the point: per-request allocations in
+// the client face are never reclaimed.
+//
+// The same disease, measured on the server face and in the
+// full proxy path, is documented in docs/M1_DELIVERY.md:
+// server ~29 kB fixed + ~1x response body per request; the
+// slanginx bench process was OOM-killed at 41.7 GB RSS.
+//
+// Needs the fixture on 127.0.0.1:19001:
+//   python3 scripts/upstream_fixture.py 19001 A
+// Run from the repo root, watching the test process's RSS:
+//   sa test docs/repro/client_loop_memory_growth.sla
+
+@import "sa_std/http_client.sai"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+
+fn one(client: ptr) -> u32 {
+    let ureq: ptr = PTR_NULL();
+    if sa_http_client_req_new_v2(client, 1, STR_PTR("http://127.0.0.1:19001/hello"), STR_LEN("http://127.0.0.1:19001/hello"), &ureq) != 0 { return 1; };
+    sa_http_client_req_set_timeout_v2(ureq, 4000);
+    let uresp: ptr = PTR_NULL();
+    let st: u32 = sa_http_client_req_send_v2(ureq, &uresp);
+    if st != 0 {
+        sa_http_client_req_free(ureq);
+        return 2;
+    };
+    let bp: ptr = PTR_NULL();
+    let bl: u64 = 0;
+    sa_http_client_resp_body_slice(uresp, &bp, &bl);
+    sa_http_client_resp_free(uresp);
+    sa_http_client_req_free(ureq);
+    return 0;
+}
+
+@test "client loop 8000"() {
+    let client: ptr = PTR_NULL();
+    if sa_http_client_new_v2(0, STR_PTR(""), 0, &client) != 0 { panic(801); };
+    let i: i32 = 0;
+    while i < 8000 {
+        if one(client) != 0 { panic(802); };
+        i = i + 1;
+    }
+    sa_http_client_free(client);
+}

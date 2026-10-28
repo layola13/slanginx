@@ -1,0 +1,28 @@
+// REPRO (defect D5, SLA/SAB referee): computing
+// PTR_BYTE_ADD(&local_array, 0) INLINE at several call sites
+// in one function traps UseAfterMove (1009) at SAB lowering,
+// although taking an address is a borrow, not a move. The
+// identical program with the pointer bound ONCE to a variable
+// and reused passes (that bind-once shape is the house idiom
+// in this repo for exactly this reason).
+//
+// Self-contained; run from the repo root:
+//   sa test docs/repro/ptr_byte_add_inline_repeat.sla
+// Expected today: UseAfterMove trap naming a tmp register.
+// Expected after a fix: the test passes.
+
+@import "sa_std/globals.sai"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+
+@test "repro D5: third get with inline ptr"() {
+    if sa_global_bytes_set(STR_PTR("probe/b1"), STR_LEN("probe/b1"), STR_PTR("hello"), STR_LEN("hello")) != 0 { panic(208); };
+    let buf: [u8; 16] = [0u8; 16];
+    let bl: u64 = 0;
+    if sa_global_bytes_get(STR_PTR("probe/b1"), STR_LEN("probe/b1"), PTR_BYTE_ADD(&buf, 0), 16, &bl) != 0 { panic(209); };
+    if bl != 5 { panic(210); };
+    let st3: i32 = sa_global_bytes_get(STR_PTR("probe/b1"), STR_LEN("probe/b1"), PTR_BYTE_ADD(&buf, 0), 2, &bl);
+    if st3 != 9 { panic(213); };
+    if bl != 5 { panic(214); };
+    if sa_global_bytes_get(STR_PTR("probe/nope"), STR_LEN("probe/nope"), PTR_BYTE_ADD(&buf, 0), 16, &bl) != 3 { panic(215); };
+}

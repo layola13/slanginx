@@ -1,0 +1,60 @@
+// REPRO (gap G5, sa_std HTTP client): a user-agent header set
+// with sa_http_client_req_add_header_v2 never reaches the wire;
+// the upstream sees std.http's own default ("zig/<ver>
+// (std.http)"). The wrapper runtime contains no user-agent
+// handling at all (grep "user-agent" / "user_agent" in
+// sa_http_client.zig: zero hits), and the .sai exposes no
+// dedicated setter. This test PINS the current behavior: it
+// passes while the gap exists and fails once the face honors
+// the header (at which point slanginx's proxy user-agent
+// forwarding starts working and this repro should be retired).
+//
+// Needs the echo fixture on 127.0.0.1:19001:
+//   python3 scripts/upstream_fixture.py 19001 A
+// Run from the repo root:
+//   sa test docs/repro/user_agent_header_not_forwarded.sla
+
+@import "sa_std/http_client.sai"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+
+fn contains(p: ptr, n: u64, lit: ptr, lit_len: u64) -> bool {
+    if n < lit_len {
+        return false;
+    };
+    let i: u64 = 0;
+    while i + lit_len <= n {
+        let same: bool = true;
+        let j: u64 = 0;
+        while j < lit_len {
+            if PTR_BYTE_AT(p, i + j) != PTR_BYTE_AT(lit, j) {
+                same = false;
+            };
+            j = j + 1;
+        }
+        if same {
+            return true;
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+@test "repro G5: user-agent add_header does not reach the wire"() {
+    let client: ptr = PTR_NULL();
+    if sa_http_client_new_v2(0, STR_PTR(""), 0, &client) != 0 { panic(701); };
+    let ureq: ptr = PTR_NULL();
+    if sa_http_client_req_new_v2(client, 1, STR_PTR("http://127.0.0.1:19001/echo"), STR_LEN("http://127.0.0.1:19001/echo"), &ureq) != 0 { panic(702); };
+    sa_http_client_req_add_header_v2(ureq, STR_PTR("user-agent"), STR_LEN("user-agent"), STR_PTR("probe-ua/1.0"), STR_LEN("probe-ua/1.0"));
+    let uresp: ptr = PTR_NULL();
+    let st: u32 = sa_http_client_req_send_v2(ureq, &uresp);
+    if st != 0 { panic(703); };
+    let bp: ptr = PTR_NULL();
+    let bl: u64 = 0;
+    if sa_http_client_resp_body_slice(uresp, &bp, &bl) != 0 { panic(704); };
+    if contains(bp, bl, STR_PTR("probe-ua"), STR_LEN("probe-ua")) { panic(705); };
+    if contains(bp, bl, STR_PTR("zig/"), STR_LEN("zig/")) { } else { panic(706); };
+    sa_http_client_resp_free(uresp);
+    sa_http_client_req_free(ureq);
+    sa_http_client_free(client);
+}
