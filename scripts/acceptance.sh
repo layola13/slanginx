@@ -3,7 +3,10 @@
 # (copied from src/main) in the repo root. Drives the real server
 # with curl across three runs:
 #   run 1: shipped slanginx.toml (port 18090, root www)
-#   run 2: alt TOML: port 18091 + max_file_bytes=1024 (streaming path)
+#   run 2: alt TOML: port 18091 + max_file_bytes=1024 (M1 streaming
+#     path; since the improvement line the static path is sendfile
+#     (G3') and max_file_bytes no longer gates it -- the run's
+#     byte-exactness checks are unchanged, as are their names)
 #   run 3: alt TOML: port 18092 + root www-assets (TOML root change)
 # Prints PASS/FAIL per check; exit code = number of failures (0=ok).
 set -u
@@ -240,14 +243,12 @@ grep -q "hello from upstream B" /tmp/r4_h2 && ok "proxy GET /api/hello -> upstre
 
 curl -s --path-as-is -A "proxy-check/1.0" -H "Accept-Language: xx-accept" -o /tmp/r4_echo $B/api/echo?x=1
 grep -q "^method GET" /tmp/r4_echo && ok "proxy echo: method forwarded" || bad "proxy echo method: $(cat /tmp/r4_echo)"
-grep -q "^path /api/echo" /tmp/r4_echo && ok "proxy echo: full path forwarded (query not exposed by the server face, G4)" || bad "proxy echo path"
+grep -q "^path /api/echo" /tmp/r4_echo && ok "proxy echo: full path forwarded" || bad "proxy echo path"
+grep -q "^path /api/echo?x=1" /tmp/r4_echo && ok "proxy echo: query string forwarded unchanged (G4)" || bad "proxy echo query: $(grep '^path' /tmp/r4_echo)"
 grep -q "^x-forwarded-for 127.0.0.1" /tmp/r4_echo && ok "proxy echo: x-forwarded-for carries the peer (G2)" || bad "proxy echo xff"
 grep -q "^x-real-ip 127.0.0.1" /tmp/r4_echo && ok "proxy echo: x-real-ip carries the peer" || bad "proxy echo x-real-ip"
 grep -q "^accept-language xx-accept" /tmp/r4_echo && ok "proxy echo: accept-language forwarded" || bad "proxy echo accept-language"
-# NOTE: the echo's user-agent line shows the std client's own
-# default, not the client's UA -- add_header_v2("user-agent")
-# never reaches the wire (G5, docs/M1_DELIVERY.md). No check
-# asserts it until the client face honors the header.
+grep -q "^user-agent proxy-check/1.0" /tmp/r4_echo && ok "proxy echo: client user-agent reaches the upstream (G5)" || bad "proxy echo user-agent: $(grep '^user-agent' /tmp/r4_echo)"
 
 curl -s --path-as-is --data-binary "abc123xyz" -H "Content-Type: text/x-test" -o /tmp/r4_post $B/api/echo
 grep -q "^method POST" /tmp/r4_post && ok "proxy POST: method forwarded" || bad "proxy POST method"

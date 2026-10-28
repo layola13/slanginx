@@ -25,18 +25,16 @@
 //     chunked-streamed, so the upstream content-length is not
 //     forwarded (framing is hop-by-hop); HEAD relays use the
 //     G1 head shape and preserve the upstream content-length.
-//   - two std-face limits shape this module (registered in
-//     docs/M1_DELIVERY.md): the server face exposes no query
-//     string (G4 -- grep finds no "query" in the std server
-//     runtime at all), so the forwarded target is the path
-//     only; and a client HEAD request segfaults the std client
-//     inside req_send_v2 (D6, minimal repro on file), so HEAD
-//     is fetched upstream as GET and only its headers are
-//     relayed -- the client still receives a correct HEAD
-//     response, the upstream sees a GET. Also, the client
-//     face's add_header for user-agent never reaches the wire
-//     (G5: std.http's own default wins); the header stays in
-//     the forward list for the day the face honors it.
+//   - three M1 std-face limits shaped this module; the
+//     improvement line closed all three in sa_std: the server
+//     face exposes the query string (G4, req_get_query_v2) and
+//     it is appended to the forwarded target below; a client
+//     HEAD request no longer crashes/blocks in req_send_v2
+//     (D6), so HEAD is fetched upstream as HEAD and relayed
+//     head-only; and the client face honors add_header for
+//     user-agent and the other slotted standard headers (G5),
+//     so the user-agent entry in the forward list below now
+//     takes effect on the wire.
 //   - per-upstream request/error counters live in the shared
 //     dict zone named "stats" when the operator declares it
 //     (docs/HANDLER_MODEL.md): the only state this module
@@ -320,20 +318,17 @@ fn proxy_attempt(req: ptr, pc: &ProxyConfig, slot: u64,
     tb_push_dec(&url, pc.srv_ports[slot] as u64);
     tb_push(&url, target, target_len);
     let url_ptr: ptr = PTR_BYTE_ADD(&url.bytes, 0);
-    // D6 workaround: a client HEAD (method 5) crashes the std
-    // client inside req_send_v2, so HEAD is fetched as GET and
-    // relayed head-only below.
-    let wire_code: u8 = method_code;
-    if wire_code == 5 {
-        wire_code = 1;
-    };
+    // The wire method is the client's own method, HEAD included:
+    // the D6 defect that forced an as-GET fetch in M1 is fixed in
+    // the std client (a HEAD response is head-only by definition
+    // and the client no longer waits for body bytes).
     let client: ptr = PTR_NULL();
     if sa_http_client_new_v2(0, STR_PTR(""), 0, &client) != 0 {
         ar.net_status = 6;
         return ar;
     };
     let ureq: ptr = PTR_NULL();
-    if sa_http_client_req_new_v2(client, wire_code, url_ptr, url.len, &ureq) != 0 {
+    if sa_http_client_req_new_v2(client, method_code, url_ptr, url.len, &ureq) != 0 {
         sa_http_client_free(client);
         ar.net_status = 5;
         return ar;
@@ -361,10 +356,10 @@ fn proxy_attempt(req: ptr, pc: &ProxyConfig, slot: u64,
     };
     ar.status = sa_http_client_resp_status(uresp) as u32;
     if method_code == 5 {
-        // HEAD relay (the response object answers the GET the
-        // D6 workaround sent): preserve the upstream
-        // content-length via the G1 head shape; the GET body is
-        // discarded unread and no body bytes reach the client.
+        // HEAD relay: the response object answers a real HEAD
+        // (its body is empty by construction); preserve the
+        // upstream content-length via the G1 head shape and no
+        // body bytes reach the client.
         let clen = DictNum { value: 0 };
         let hv: ptr = PTR_NULL();
         let hl: u64 = 0;
@@ -424,6 +419,7 @@ fn proxy_serve(req: ptr, pc: &ProxyConfig, dz: &DictZones,
                route_idx: i32,
                method_ptr: ptr, method_len: u64,
                raw_ptr: ptr, raw_len: u64,
+               query_ptr: ptr, query_len: u64,
                norm_ptr: ptr, norm_len: u64,
                peer_ptr: ptr, peer_len: u64, peer_known: bool,
                now: u64) -> ProxyResult {
@@ -435,16 +431,20 @@ fn proxy_serve(req: ptr, pc: &ProxyConfig, dz: &DictZones,
         res.body_bytes = proxy_send_simple(req, 405, STR_PTR("method not allowed\n"), STR_LEN("method not allowed\n"));
         return res;
     };
-    // Forward target: "/" + normalized path. The route prefix
-    // is NOT stripped (proxy_pass without a URI part). The
-    // query string cannot be forwarded: the server face's
-    // req_get_path returns the path only and no raw-target or
-    // query getter exists (G4) -- when one lands, the query is
-    // appended here. raw_ptr/raw_len are kept in the signature
-    // for that day and for the access path's symmetry.
+    // Forward target: "/" + normalized path, plus "?" + the raw
+    // query string when the request carried one (G4: the query
+    // is forwarded byte-exact, never decoded or re-encoded, and
+    // no "?" is added when it is absent). The route prefix is
+    // NOT stripped (proxy_pass without a URI part).
+    // raw_ptr/raw_len (the undecoded path) stay in the signature
+    // for the access path's symmetry.
     let target = tb_new();
     tb_push_byte(&target, 47);
     tb_push(&target, norm_ptr, norm_len);
+    if query_len > 0 {
+        tb_push_byte(&target, 63);
+        tb_push(&target, query_ptr, query_len);
+    };
     let target_ptr: ptr = PTR_BYTE_ADD(&target.bytes, 0);
     stats_incr(pc, dz, pool_idx, STR_PTR("requests"), STR_LEN("requests"), now);
     let server_count: u64 = pc.pool_server_counts[pool_idx];

@@ -145,6 +145,16 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones) -> O
     };
     copy_capped_16(&o, m_ptr, m_len);
     copy_capped_1024(&o, p_ptr, p_len);
+    // --- query string (G4 backfill): the server face grew a
+    // query getter; the proxy appends it to the forward target.
+    // An absent query is ok with length 0. A getter failure is
+    // treated as no query (the path alone is still forwarded);
+    // it cannot fabricate one. ---
+    let q_ptr: ptr = PTR_NULL();
+    let q_len: u64 = 0;
+    if sa_http_server_req_get_query_v2(req, &q_ptr, &q_len) != 0 {
+        q_len = 0;
+    };
     let ua_ptr: ptr = PTR_NULL();
     let ua_len: u64 = 0;
     if sa_http_server_req_get_header(req, STR_PTR("user-agent"), STR_LEN("user-agent"), &ua_ptr, &ua_len) == 0 {
@@ -219,6 +229,7 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones) -> O
         let remote_ptr: ptr = PTR_BYTE_ADD(&o.remote, 0);
         let pr = proxy_serve(req, pc, dz, route_idx,
                              m_ptr, m_len, p_ptr, p_len,
+                             q_ptr, q_len,
                              norm_ptr, resolved.len,
                              remote_ptr, o.remote_len, peer_known,
                              dict_now());

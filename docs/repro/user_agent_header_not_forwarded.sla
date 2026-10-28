@@ -1,13 +1,18 @@
-// REPRO (gap G5, sa_std HTTP client): a user-agent header set
-// with sa_http_client_req_add_header_v2 never reaches the wire;
-// the upstream sees std.http's own default ("zig/<ver>
-// (std.http)"). The wrapper runtime contains no user-agent
-// handling at all (grep "user-agent" / "user_agent" in
-// sa_http_client.zig: zero hits), and the .sai exposes no
-// dedicated setter. This test PINS the current behavior: it
-// passes while the gap exists and fails once the face honors
-// the header (at which point slanginx's proxy user-agent
-// forwarding starts working and this repro should be retired).
+// REGRESSION (gap G5, sa_std HTTP client; fixed by the
+// slanginx improvement line): a user-agent header set with
+// sa_http_client_req_add_header_v2 used to never reach the
+// wire -- the upstream saw std.http's own default
+// ("zig/<ver> (std.http)"), because the wrapper passed every
+// caller header via extra_headers, where std's overridable
+// user-agent slot (emitted first, with its default) shadowed
+// it. The client now routes the six slotted standard headers
+// (host, authorization, user-agent, connection,
+// accept-encoding, content-type) into std's header slots as
+// overrides, on both the v1 and v2 send paths. This file
+// originally PINNED the gap (passed while it existed); its
+// assertions are now inverted into the standing regression:
+// the echoed user-agent must be the caller's value and must
+// not be std's default.
 //
 // Needs the echo fixture on 127.0.0.1:19001:
 //   python3 scripts/upstream_fixture.py 19001 A
@@ -40,7 +45,7 @@ fn contains(p: ptr, n: u64, lit: ptr, lit_len: u64) -> bool {
     return false;
 }
 
-@test "repro G5: user-agent add_header does not reach the wire"() {
+@test "regression G5: user-agent add_header reaches the wire"() {
     let client: ptr = PTR_NULL();
     if sa_http_client_new_v2(0, STR_PTR(""), 0, &client) != 0 { panic(701); };
     let ureq: ptr = PTR_NULL();
@@ -52,8 +57,8 @@ fn contains(p: ptr, n: u64, lit: ptr, lit_len: u64) -> bool {
     let bp: ptr = PTR_NULL();
     let bl: u64 = 0;
     if sa_http_client_resp_body_slice(uresp, &bp, &bl) != 0 { panic(704); };
-    if contains(bp, bl, STR_PTR("probe-ua"), STR_LEN("probe-ua")) { panic(705); };
-    if contains(bp, bl, STR_PTR("zig/"), STR_LEN("zig/")) { } else { panic(706); };
+    if contains(bp, bl, STR_PTR("probe-ua"), STR_LEN("probe-ua")) { } else { panic(705); };
+    if contains(bp, bl, STR_PTR("zig/"), STR_LEN("zig/")) { panic(706); };
     sa_http_client_resp_free(uresp);
     sa_http_client_req_free(ureq);
     sa_http_client_free(client);

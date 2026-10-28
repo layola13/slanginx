@@ -1,11 +1,21 @@
-// REPRO (defect D6, sa_std HTTP client): a client HEAD request
-// segfaults the process inside sa_http_client_req_send_v2.
+// REGRESSION (defect D6, sa_std HTTP client; fixed by the
+// slanginx improvement line): a client HEAD request used to
+// segfault the process inside sa_http_client_req_send_v2.
 // Minimal shape: v2 client + req_new_v2 with method code 5
-// (HEAD) + send. The test process dies with signal 11 before
-// any assertion runs; the same flow with method 1 (GET) passes
-// (see the M1 probe series in docs/M1_DELIVERY.md).
+// (HEAD) + send; the test process died with signal 11 before
+// any assertion ran, while the same flow with method 1 (GET)
+// passed. Root cause (in sci's sa_http_client): for HEAD,
+// std's Response.reader() returns the shared Io.Reader.ending
+// singleton -- a @constCast pointer to a const global that
+// lands in .data.rel.ro and is mapped read-only after
+// relocation in zig-cc/LLD-linked binaries (how SA binaries
+// are linked) -- and readSliceShort writes the reader's seek
+// field through it. The client now skips the body read loop
+// for methods whose response has no body by definition.
+// Kept as the standing regression: on the pre-fix std this
+// test dies with signal 11; on the fixed std it passes.
 //
-// Needs a HEAD-capable upstream on 127.0.0.1:19001, e.g.:
+// Needs a HEAD-capable upstream on 127.0.0.1:19001:
 //   python3 scripts/upstream_fixture.py 19001 A
 // Run from the repo root:
 //   sa test docs/repro/client_head_send_segfault.sla
