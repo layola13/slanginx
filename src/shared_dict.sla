@@ -1,0 +1,448 @@
+// shared_dict: the shared-state facility of slanginx, per the
+// final handler-model ruling (docs/HANDLER_MODEL.md, option A).
+//
+// Handlers hold no state. The only cross-request mutable surface
+// is a set of named zones declared in the TOML layer
+// ([shared_dict.N]: name + capacity) and backed by the sa_std
+// named-cell facility (sa_global_* in sa_std/globals.sai:
+// process-wide cells, mutex-guarded inside sa_std -- the
+// sa_std-layer KV this ruling requires; SLA's Mutex<T> accepts
+// only scalars, so no shared structure is composed at the SLA
+// layer anywhere in this server).
+//
+// Cell layout (bytes and u64 cells are independent namespaces
+// in sa_std):
+//   bytes  "sd/<zone>/<key>"     the value facet (set/get)
+//   u64    "sd/<zone>/<key>"     the counter facet (incr/get_num)
+//   u64    "sd/<zone>/<key>#e"   expiry, unix seconds (0 = none)
+//   u64    "sd/<zone>/#n"        distinct-key count (capacity)
+// Keys starting with '#' are reserved and rejected at the API.
+//
+// Expiry is logical: an expired entry reads as missing and is
+// overwritten by the next set/incr. The std cell facility has
+// no delete primitive, so capacity counts distinct keys ever
+// set in the bytes facet; a full zone refuses NEW keys with an
+// explicit DICT_FULL -- never a silent eviction.
+//
+// Every function takes the current time as a parameter (callers
+// pass dict_now()) so the decision logic is unit-testable
+// without sleeping.
+
+@import "sa_std/globals.sai"
+@import "sa_std/time.sai"
+@import "sa_std/encoding/toml.sai"
+@import "sa_std/encoding/toml.sla"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+
+// Result codes.
+const DICT_OK: i32 = 0;
+const DICT_NOT_FOUND: i32 = 1;
+const DICT_FULL: i32 = 2;
+const DICT_TOO_LARGE: i32 = 3;
+const DICT_BAD_ARG: i32 = 4;
+const DICT_STD_ERR: i32 = 5;
+
+const DICT_MAX_ZONES: u64 = 4;
+const DICT_ZONE_NAME_MAX: u64 = 31;
+const DICT_KEY_MAX: u64 = 96;
+const DICT_VALUE_MAX: u64 = 8192;
+
+struct DictZones {
+    names: [u8; 128],
+    name_lens: [u64; 4],
+    caps: [u64; 4],
+    count: u64,
+}
+
+struct CellName {
+    bytes: [u8; 192],
+    len: u64,
+}
+
+struct DictNum {
+    value: u64,
+}
+
+struct DictRead {
+    len: u64,
+}
+
+fn dictnum_new() -> DictNum {
+    return DictNum { value: 0 };
+}
+
+fn dictread_new() -> DictRead {
+    return DictRead { len: 0 };
+}
+
+fn dictzones_new() -> DictZones {
+    return DictZones {
+        names: [0u8; 128], name_lens: [0u64; 4],
+        caps: [0u64; 4], count: 0,
+    };
+}
+
+fn cell_push(b: &CellName, src: ptr, n: u64) {
+    let i: u64 = 0;
+    while i < n {
+        if b.len < 192 {
+            b.bytes[b.len] = PTR_BYTE_AT(src, i);
+            b.len = b.len + 1;
+        };
+        i = i + 1;
+    }
+}
+
+fn cell_push_byte(b: &CellName, byte: u8) {
+    if b.len < 192 {
+        b.bytes[b.len] = byte;
+        b.len = b.len + 1;
+    };
+}
+
+// Index of the declared zone with this name, or -1.
+fn dictzones_find(z: &DictZones, name: ptr, name_len: u64) -> i32 {
+    let i: u64 = 0;
+    while i < z.count {
+        if z.name_lens[i] == name_len {
+            let same: bool = true;
+            let j: u64 = 0;
+            while j < name_len {
+                if z.names[i * 32 + j] != PTR_BYTE_AT(name, j) {
+                    same = false;
+                };
+                j = j + 1;
+            }
+            if same {
+                return i as i32;
+            };
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Fill zones from the parsed TOML doc ([shared_dict.N] sections,
+// N = 0..3). Returns 0 ok / 3 bad declaration (missing name or
+// capacity, wrong type, oversize name, duplicate zone).
+fn dictzones_fill(z: &DictZones, doc: u64) -> i32 {
+    let i: u64 = 0;
+    while i < DICT_MAX_ZONES {
+        // path: shared_dict.<i>.name
+        let path = CellName { bytes: [0u8; 192], len: 0 };
+        cell_push(&path, STR_PTR("shared_dict."), STR_LEN("shared_dict."));
+        cell_push_byte(&path, (48 + i) as u8);
+        cell_push(&path, STR_PTR(".name"), STR_LEN(".name"));
+        let pp: ptr = PTR_BYTE_ADD(&path.bytes, 0);
+        let kind: u32 = 0;
+        if sa_toml_kind(doc, pp, path.len, &kind) != 0 {
+            return 0;
+        };
+        if kind != SA_TOML_KIND_STRING {
+            return 3;
+        };
+        let vp: ptr = PTR_NULL();
+        let vl: u64 = 0;
+        if sa_toml_get_string(doc, pp, path.len, &vp, &vl) != 0 {
+            return 3;
+        };
+        if vl == 0 {
+            return 3;
+        };
+        if vl > DICT_ZONE_NAME_MAX {
+            return 3;
+        };
+        if dictzones_find(z, vp, vl) >= 0 {
+            return 3;
+        };
+        let j: u64 = 0;
+        while j < vl {
+            z.names[i * 32 + j] = PTR_BYTE_AT(vp, j);
+            j = j + 1;
+        }
+        z.name_lens[i] = vl;
+        // path: shared_dict.<i>.capacity (required, integer >= 1)
+        let cpath = CellName { bytes: [0u8; 192], len: 0 };
+        cell_push(&cpath, STR_PTR("shared_dict."), STR_LEN("shared_dict."));
+        cell_push_byte(&cpath, (48 + i) as u8);
+        cell_push(&cpath, STR_PTR(".capacity"), STR_LEN(".capacity"));
+        let cp: ptr = PTR_BYTE_ADD(&cpath.bytes, 0);
+        let ckind: u32 = 0;
+        if sa_toml_kind(doc, cp, cpath.len, &ckind) != 0 {
+            return 3;
+        };
+        if ckind != SA_TOML_KIND_INTEGER {
+            return 3;
+        };
+        let cv: i64 = 0;
+        if sa_toml_get_i64(doc, cp, cpath.len, &cv) != 0 {
+            return 3;
+        };
+        if cv < 1 {
+            return 3;
+        };
+        z.caps[i] = cv as u64;
+        z.count = i + 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn dict_now() -> u64 {
+    let s: i64 = sa_time_unix_s();
+    if s < 0 {
+        return 0;
+    };
+    return s as u64;
+}
+
+// Pure liveness decision (unit-tested): exp == 0 means no
+// expiry; otherwise the entry dies when now reaches exp.
+fn dict_entry_live(exp: u64, now: u64) -> bool {
+    if exp == 0 {
+        return true;
+    };
+    return now < exp;
+}
+
+fn dict_cell(zone: ptr, zone_len: u64, key: ptr, key_len: u64, exp: bool) -> CellName {
+    let c = CellName { bytes: [0u8; 192], len: 0 };
+    cell_push(&c, STR_PTR("sd/"), STR_LEN("sd/"));
+    cell_push(&c, zone, zone_len);
+    cell_push_byte(&c, 47);
+    cell_push(&c, key, key_len);
+    if exp {
+        cell_push(&c, STR_PTR("#e"), STR_LEN("#e"));
+    };
+    return c;
+}
+
+fn dict_key_ok(key: ptr, key_len: u64) -> bool {
+    if key_len == 0 {
+        return false;
+    };
+    if key_len > DICT_KEY_MAX {
+        return false;
+    };
+    if PTR_BYTE_AT(key, 0) == 35 {
+        return false;
+    };
+    return true;
+}
+
+fn dict_zone_ok(zone_len: u64) -> bool {
+    if zone_len == 0 {
+        return false;
+    };
+    if zone_len > DICT_ZONE_NAME_MAX {
+        return false;
+    };
+    return true;
+}
+
+// Read the expiry cell. Missing cell = no expiry (0). Returns
+// DICT_OK / DICT_STD_ERR; res.value receives the expiry.
+fn dict_read_exp(zone: ptr, zone_len: u64, key: ptr, key_len: u64, res: &DictNum) -> i32 {
+    let cell = dict_cell(zone, zone_len, key, key_len, true);
+    let cp: ptr = PTR_BYTE_ADD(&cell.bytes, 0);
+    let v: u64 = 0;
+    let st: i32 = sa_global_u64_get(cp, cell.len, &v);
+    if st == 0 {
+        res.value = v;
+        return DICT_OK;
+    };
+    if st == 3 {
+        res.value = 0;
+        return DICT_OK;
+    };
+    return DICT_STD_ERR;
+}
+
+fn dict_set(zone: ptr, zone_len: u64, cap: u64,
+            key: ptr, key_len: u64,
+            val: ptr, val_len: u64,
+            ttl_s: u64, now: u64) -> i32 {
+    if !dict_zone_ok(zone_len) {
+        return DICT_BAD_ARG;
+    };
+    if !dict_key_ok(key, key_len) {
+        return DICT_BAD_ARG;
+    };
+    if val_len > DICT_VALUE_MAX {
+        return DICT_BAD_ARG;
+    };
+    let cell = dict_cell(zone, zone_len, key, key_len, false);
+    let cp: ptr = PTR_BYTE_ADD(&cell.bytes, 0);
+    // New key? Probe with a zero-capacity get: 0 or 9 means the
+    // cell exists, 3 (NOT_FOUND) means it does not.
+    let probe: [u8; 1] = [0u8; 1];
+    let probe_ptr: ptr = PTR_BYTE_ADD(&probe, 0);
+    let need: u64 = 0;
+    let pst: i32 = sa_global_bytes_get(cp, cell.len, probe_ptr, 0, &need);
+    let is_new: bool = false;
+    if pst == 3 {
+        is_new = true;
+    } else {
+        if pst != 0 {
+            if pst != 9 {
+                return DICT_STD_ERR;
+            };
+        };
+    };
+    if is_new {
+        let ccell = dict_cell(zone, zone_len, STR_PTR("#n"), STR_LEN("#n"), false);
+        let ccp: ptr = PTR_BYTE_ADD(&ccell.bytes, 0);
+        let count: u64 = 0;
+        let cst: i32 = sa_global_u64_get(ccp, ccell.len, &count);
+        if cst == 0 {
+        } else {
+            if cst == 3 {
+                count = 0;
+            } else {
+                return DICT_STD_ERR;
+            };
+        };
+        if count >= cap {
+            return DICT_FULL;
+        };
+    };
+    if sa_global_bytes_set(cp, cell.len, val, val_len) != 0 {
+        return DICT_STD_ERR;
+    };
+    if is_new {
+        let ccell2 = dict_cell(zone, zone_len, STR_PTR("#n"), STR_LEN("#n"), false);
+        let ccp2: ptr = PTR_BYTE_ADD(&ccell2.bytes, 0);
+        let bumped: u64 = 0;
+        if sa_global_u64_add(ccp2, ccell2.len, 1, &bumped) != 0 {
+            return DICT_STD_ERR;
+        };
+    };
+    let ecell = dict_cell(zone, zone_len, key, key_len, true);
+    let ecp: ptr = PTR_BYTE_ADD(&ecell.bytes, 0);
+    let target: u64 = 0;
+    if ttl_s > 0 {
+        target = now + ttl_s;
+    };
+    if sa_global_u64_set(ecp, ecell.len, target) != 0 {
+        return DICT_STD_ERR;
+    };
+    return DICT_OK;
+}
+
+fn dict_get(zone: ptr, zone_len: u64,
+            key: ptr, key_len: u64,
+            out: ptr, out_cap: u64, res: &DictRead,
+            now: u64) -> i32 {
+    if !dict_zone_ok(zone_len) {
+        return DICT_BAD_ARG;
+    };
+    if !dict_key_ok(key, key_len) {
+        return DICT_BAD_ARG;
+    };
+    let exp = DictNum { value: 0 };
+    if dict_read_exp(zone, zone_len, key, key_len, &exp) != DICT_OK {
+        return DICT_STD_ERR;
+    };
+    if !dict_entry_live(exp.value, now) {
+        return DICT_NOT_FOUND;
+    };
+    let cell = dict_cell(zone, zone_len, key, key_len, false);
+    let cp: ptr = PTR_BYTE_ADD(&cell.bytes, 0);
+    let need: u64 = 0;
+    let st: i32 = sa_global_bytes_get(cp, cell.len, out, out_cap, &need);
+    if st == 0 {
+        res.len = need;
+        return DICT_OK;
+    };
+    if st == 3 {
+        return DICT_NOT_FOUND;
+    };
+    if st == 9 {
+        res.len = need;
+        return DICT_TOO_LARGE;
+    };
+    return DICT_STD_ERR;
+}
+
+fn dict_incr(zone: ptr, zone_len: u64,
+             key: ptr, key_len: u64,
+             delta: i64, ttl_s: u64, now: u64,
+             res: &DictNum) -> i32 {
+    if !dict_zone_ok(zone_len) {
+        return DICT_BAD_ARG;
+    };
+    if !dict_key_ok(key, key_len) {
+        return DICT_BAD_ARG;
+    };
+    let exp = DictNum { value: 0 };
+    if dict_read_exp(zone, zone_len, key, key_len, &exp) != DICT_OK {
+        return DICT_STD_ERR;
+    };
+    let cell = dict_cell(zone, zone_len, key, key_len, false);
+    let cp: ptr = PTR_BYTE_ADD(&cell.bytes, 0);
+    if dict_entry_live(exp.value, now) {
+        let v: u64 = 0;
+        if sa_global_u64_add(cp, cell.len, delta, &v) != 0 {
+            return DICT_STD_ERR;
+        };
+        res.value = v;
+        // Creation-time TTL: a counter born from this incr with
+        // no expiry recorded yet adopts the caller's TTL.
+        if exp.value == 0 {
+            if ttl_s > 0 {
+                let ecell = dict_cell(zone, zone_len, key, key_len, true);
+                let ecp: ptr = PTR_BYTE_ADD(&ecell.bytes, 0);
+                if sa_global_u64_set(ecp, ecell.len, now + ttl_s) != 0 {
+                    return DICT_STD_ERR;
+                };
+            };
+        };
+        return DICT_OK;
+    };
+    // Expired: restart from the delta, with a fresh expiry.
+    if sa_global_u64_set(cp, cell.len, delta as u64) != 0 {
+        return DICT_STD_ERR;
+    };
+    res.value = delta as u64;
+    let ecell2 = dict_cell(zone, zone_len, key, key_len, true);
+    let ecp2: ptr = PTR_BYTE_ADD(&ecell2.bytes, 0);
+    let target: u64 = 0;
+    if ttl_s > 0 {
+        target = now + ttl_s;
+    };
+    if sa_global_u64_set(ecp2, ecell2.len, target) != 0 {
+        return DICT_STD_ERR;
+    };
+    return DICT_OK;
+}
+
+fn dict_get_num(zone: ptr, zone_len: u64,
+                key: ptr, key_len: u64,
+                res: &DictNum, now: u64) -> i32 {
+    if !dict_zone_ok(zone_len) {
+        return DICT_BAD_ARG;
+    };
+    if !dict_key_ok(key, key_len) {
+        return DICT_BAD_ARG;
+    };
+    let exp = DictNum { value: 0 };
+    if dict_read_exp(zone, zone_len, key, key_len, &exp) != DICT_OK {
+        return DICT_STD_ERR;
+    };
+    if !dict_entry_live(exp.value, now) {
+        return DICT_NOT_FOUND;
+    };
+    let cell = dict_cell(zone, zone_len, key, key_len, false);
+    let cp: ptr = PTR_BYTE_ADD(&cell.bytes, 0);
+    let v: u64 = 0;
+    let st: i32 = sa_global_u64_get(cp, cell.len, &v);
+    if st == 0 {
+        res.value = v;
+        return DICT_OK;
+    };
+    if st == 3 {
+        return DICT_NOT_FOUND;
+    };
+    return DICT_STD_ERR;
+}

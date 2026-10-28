@@ -1,0 +1,95 @@
+// Unit tests for shared_dict.sla: liveness decision, set/get,
+// capacity discipline, incr, logical TTL expiry, zone fill.
+// The dict is backed by process-wide sa_std cells, so every
+// test uses its own zone name to stay independent.
+// Run from the repo root:
+//   sa test tests/shared_dict_test.sla
+
+@import "src/shared_dict.sla"
+@import "sa_std/encoding/toml.sai"
+@import "sa_std/encoding/toml.sla"
+@import "sa_std/string.sa"
+
+@test "entry liveness is a pure decision"() {
+    if dict_entry_live(0, 100) { } else { panic(501); };
+    if dict_entry_live(150, 100) { } else { panic(502); };
+    if dict_entry_live(100, 100) { panic(503); };
+    if dict_entry_live(50, 100) { panic(504); };
+}
+
+@test "set and get roundtrip, overwrite, missing"() {
+    let buf: [u8; 16] = [0u8; 16];
+    let bp: ptr = PTR_BYTE_ADD(&buf, 0);
+    let r = dictread_new();
+    if dict_set(STR_PTR("tz-round"), STR_LEN("tz-round"), 4, STR_PTR("k1"), STR_LEN("k1"), STR_PTR("hello"), STR_LEN("hello"), 0, 1000) != DICT_OK { panic(511); };
+    if dict_get(STR_PTR("tz-round"), STR_LEN("tz-round"), STR_PTR("k1"), STR_LEN("k1"), bp, 16, &r, 1000) != DICT_OK { panic(512); };
+    if r.len != 5 { panic(513); };
+    if buf[0] != 104 { panic(514); };
+    if buf[4] != 111 { panic(515); };
+    if dict_set(STR_PTR("tz-round"), STR_LEN("tz-round"), 4, STR_PTR("k1"), STR_LEN("k1"), STR_PTR("world!"), STR_LEN("world!"), 0, 1000) != DICT_OK { panic(516); };
+    if dict_get(STR_PTR("tz-round"), STR_LEN("tz-round"), STR_PTR("k1"), STR_LEN("k1"), bp, 16, &r, 1000) != DICT_OK { panic(517); };
+    if r.len != 6 { panic(518); };
+    if dict_get(STR_PTR("tz-round"), STR_LEN("tz-round"), STR_PTR("nope"), STR_LEN("nope"), bp, 16, &r, 1000) != DICT_NOT_FOUND { panic(519); };
+    // a too-small read buffer reports the needed length
+    if dict_get(STR_PTR("tz-round"), STR_LEN("tz-round"), STR_PTR("k1"), STR_LEN("k1"), bp, 2, &r, 1000) != DICT_TOO_LARGE { panic(520); };
+    if r.len != 6 { panic(521); };
+}
+
+@test "capacity refuses new keys but allows overwrite"() {
+    if dict_set(STR_PTR("tz-cap"), STR_LEN("tz-cap"), 2, STR_PTR("a"), STR_LEN("a"), STR_PTR("1"), STR_LEN("1"), 0, 1000) != DICT_OK { panic(531); };
+    if dict_set(STR_PTR("tz-cap"), STR_LEN("tz-cap"), 2, STR_PTR("b"), STR_LEN("b"), STR_PTR("2"), STR_LEN("2"), 0, 1000) != DICT_OK { panic(532); };
+    if dict_set(STR_PTR("tz-cap"), STR_LEN("tz-cap"), 2, STR_PTR("c"), STR_LEN("c"), STR_PTR("3"), STR_LEN("3"), 0, 1000) != DICT_FULL { panic(533); };
+    if dict_set(STR_PTR("tz-cap"), STR_LEN("tz-cap"), 2, STR_PTR("a"), STR_LEN("a"), STR_PTR("9"), STR_LEN("9"), 0, 1000) != DICT_OK { panic(534); };
+}
+
+@test "incr accumulates and get_num reads back"() {
+    let n = dictnum_new();
+    if dict_incr(STR_PTR("tz-incr"), STR_LEN("tz-incr"), STR_PTR("n"), STR_LEN("n"), 5, 0, 1000, &n) != DICT_OK { panic(541); };
+    if n.value != 5 { panic(542); };
+    if dict_incr(STR_PTR("tz-incr"), STR_LEN("tz-incr"), STR_PTR("n"), STR_LEN("n"), 3, 0, 1000, &n) != DICT_OK { panic(543); };
+    if n.value != 8 { panic(544); };
+    if dict_get_num(STR_PTR("tz-incr"), STR_LEN("tz-incr"), STR_PTR("n"), STR_LEN("n"), &n, 1000) != DICT_OK { panic(545); };
+    if n.value != 8 { panic(546); };
+    if dict_get_num(STR_PTR("tz-incr"), STR_LEN("tz-incr"), STR_PTR("missing"), STR_LEN("missing"), &n, 1000) != DICT_NOT_FOUND { panic(547); };
+}
+
+@test "ttl expiry is logical and incr restarts after it"() {
+    let buf: [u8; 16] = [0u8; 16];
+    let bp: ptr = PTR_BYTE_ADD(&buf, 0);
+    let r = dictread_new();
+    let n = dictnum_new();
+    if dict_set(STR_PTR("tz-ttl"), STR_LEN("tz-ttl"), 8, STR_PTR("s"), STR_LEN("s"), STR_PTR("v"), STR_LEN("v"), 10, 1000) != DICT_OK { panic(551); };
+    if dict_get(STR_PTR("tz-ttl"), STR_LEN("tz-ttl"), STR_PTR("s"), STR_LEN("s"), bp, 16, &r, 1009) != DICT_OK { panic(552); };
+    if dict_get(STR_PTR("tz-ttl"), STR_LEN("tz-ttl"), STR_PTR("s"), STR_LEN("s"), bp, 16, &r, 1010) != DICT_NOT_FOUND { panic(553); };
+    if dict_incr(STR_PTR("tz-ttl"), STR_LEN("tz-ttl"), STR_PTR("c"), STR_LEN("c"), 1, 10, 1000, &n) != DICT_OK { panic(554); };
+    if n.value != 1 { panic(555); };
+    if dict_get_num(STR_PTR("tz-ttl"), STR_LEN("tz-ttl"), STR_PTR("c"), STR_LEN("c"), &n, 1015) != DICT_NOT_FOUND { panic(556); };
+    if dict_incr(STR_PTR("tz-ttl"), STR_LEN("tz-ttl"), STR_PTR("c"), STR_LEN("c"), 7, 10, 1015, &n) != DICT_OK { panic(557); };
+    if n.value != 7 { panic(558); };
+}
+
+@test "reserved keys and bad args are rejected"() {
+    if dict_set(STR_PTR("tz-bad"), STR_LEN("tz-bad"), 4, STR_PTR("#n"), STR_LEN("#n"), STR_PTR("x"), STR_LEN("x"), 0, 1000) != DICT_BAD_ARG { panic(561); };
+    if dict_set(STR_PTR(""), STR_LEN(""), 4, STR_PTR("k"), STR_LEN("k"), STR_PTR("x"), STR_LEN("x"), 0, 1000) != DICT_BAD_ARG { panic(562); };
+    if dict_set(STR_PTR("tz-bad"), STR_LEN("tz-bad"), 4, STR_PTR(""), STR_LEN(""), STR_PTR("x"), STR_LEN("x"), 0, 1000) != DICT_BAD_ARG { panic(563); };
+}
+
+@test "zones fill from toml with names and capacities"() {
+    let doc: u64 = sa_toml_parse(STR_PTR("[shared_dict.0]\nname = \"stats\"\ncapacity = 1024\n\n[shared_dict.1]\nname = \"cache\"\ncapacity = 8\n"), STR_LEN("[shared_dict.0]\nname = \"stats\"\ncapacity = 1024\n\n[shared_dict.1]\nname = \"cache\"\ncapacity = 8\n"));
+    if doc == 0 { panic(571); };
+    let dz = dictzones_new();
+    if dictzones_fill(&dz, doc) != 0 { panic(572); };
+    if dz.count != 2 { panic(573); };
+    if dictzones_find(&dz, STR_PTR("stats"), STR_LEN("stats")) != 0 { panic(574); };
+    if dictzones_find(&dz, STR_PTR("cache"), STR_LEN("cache")) != 1 { panic(575); };
+    if dictzones_find(&dz, STR_PTR("nope"), STR_LEN("nope")) != -1 { panic(576); };
+    if dz.caps[0] != 1024 { panic(577); };
+    if dz.caps[1] != 8 { panic(578); };
+    sa_toml_free(doc);
+    // a zone without capacity is a hard error, not a default
+    let doc2: u64 = sa_toml_parse(STR_PTR("[shared_dict.0]\nname = \"stats\"\n"), STR_LEN("[shared_dict.0]\nname = \"stats\"\n"));
+    if doc2 == 0 { panic(579); };
+    let dz2 = dictzones_new();
+    if dictzones_fill(&dz2, doc2) == 0 { panic(580); };
+    sa_toml_free(doc2);
+}
