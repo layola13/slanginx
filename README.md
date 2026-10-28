@@ -53,25 +53,30 @@ process model: single process, sequential accept loop.
 
 ## Registered gaps (M1)
 
-- **G3′ — no server-face send-file shape**: sa_std grew a
-  net-layer `send_file` (stream + file), but the HTTP server
-  face exposes no stream/fd accessor for a live request, so
-  static serving cannot use it; static files still go through
-  the buffered path. Seam marked in `src/main.sla`.
-- **G4 — query strings are not exposed**: the server face's
-  path getter returns the path only; proxied requests forward
-  the path without the query until a raw-target getter exists.
-- **G5 — client `user-agent` is not honored**: headers set via
-  the client face's add-header never include a user-agent on
-  the wire (std.http's default is sent); pinned by the repro
-  in `docs/repro/`.
+Closed by the improvement line (see
+`docs/IMPROVE_DELIVERY.md` for root causes, fixes and the
+regression evidence):
+
+- **G3′ — server-face send-file** ✓: the HTTP server face
+  grew `sa_http_server_resp_send_file_v2`; static serving is
+  sendfile end to end, with an explicit logged 500 (never a
+  silent buffered fallback) on platforms without sendfile.
+- **G4 — query strings exposed** ✓: the server face grew
+  `sa_http_server_req_get_target_v2` / `req_get_query_v2`;
+  the proxy forwards the query byte-exact.
+- **G5 — client `user-agent` honored** ✓: the client routes
+  the slotted standard headers (user-agent among them) into
+  std's header slots as overrides, on both send paths.
+- **D6 — client HEAD segfault** ✓: root-caused to reading a
+  body through std's shared read-only `Io.Reader.ending`
+  singleton; the client no longer reads a body for HEAD/TRACE.
+  The proxy fetches HEAD as HEAD again.
+
+Still open:
+
 - **D5 — referee quirk**: repeating `PTR_BYTE_ADD(&local, 0)`
   inline at several call sites traps UseAfterMove; the house
   idiom binds the pointer once. Repro in `docs/repro/`.
-- **D6 — client HEAD send segfaults** in sa_std (signal 11
-  inside `req_send_v2`); the proxy fetches HEAD upstreams as
-  GET and relays headers without the body until this is fixed
-  upstream. Repro in `docs/repro/`.
 - Directory requested without a trailing slash is served its
   index directly; nginx's 301 redirect is not issued.
 - TLS/HTTP2 termination, rate limiting and caching remain

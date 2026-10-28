@@ -248,6 +248,12 @@ addressed by application-layer tuning, and none was.
 
 ## 6. Registered defects and gaps found this milestone
 
+> Addendum (improvement line, 2026-10-29): D6, G4, G5 and
+> G3′ from this section are **closed**, and F3 (§5) is done;
+> root causes, fixes and regression evidence are recorded in
+> `docs/IMPROVE_DELIVERY.md`. The registrations below are the
+> original M1 text, kept for the record.
+
 All registered with minimal repros; none fixed in this line
 (sci / sa_plugin_sla are owned by other lines; this line
 registers and works around explicitly). The performance
