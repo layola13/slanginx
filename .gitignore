@@ -2,4 +2,8 @@ build/
 *.sa
 *.sa.bc
 slanginx
+src/main
+.sla-cache/
+.sla-cache*
+src/.sa_cache/
 logs/*.log
