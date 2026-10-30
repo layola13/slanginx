@@ -26,6 +26,7 @@
 @import "sa_std/encoding/toml.sla"
 @import "sa_std/ptr.sa"
 @import "sa_std/string.sa"
+@import "sa_std/task.sai"
 
 const PROXY_MAX_POOLS: u64 = 4;
 const PROXY_MAX_SERVERS: u64 = 4;
@@ -47,6 +48,15 @@ struct ProxyConfig {
     route_prefix_lens: [u64; 8],
     route_pools: [u64; 8],
     route_count: u64,
+    // Runtime mutex (sa_sync_mutex handle) guarding pool_cursors
+    // under the per-connection goroutine serve model: workers pick
+    // upstreams concurrently, and the cursor read/advance pair must
+    // stay atomic or two workers can read the same cursor. The
+    // server core creates the mutex at boot and stores the handle
+    // here; 0 means "no mutex" (unit tests, which pick serially,
+    // keep the unguarded pure step). Set once at boot, never
+    // written again -- the field itself is read-only afterwards.
+    cursor_mutex: u64,
 }
 
 struct PathText {
@@ -63,6 +73,7 @@ fn proxyconf_new() -> ProxyConfig {
         srv_ports: [0u16; 16],
         route_prefixes: [0u8; 1024], route_prefix_lens: [0u64; 8],
         route_pools: [0u64; 8], route_count: 0,
+        cursor_mutex: 0,
     };
 }
 
@@ -392,9 +403,19 @@ fn proxyconf_pick_at(cursor: u64, count: u64) -> u64 {
 }
 
 // Pick the next server slot of a pool, advancing its cursor.
+// When the boot-time cursor mutex is installed, the read/advance
+// pair runs under it (goroutine serve model: concurrent workers
+// must not observe the same cursor); with cursor_mutex == 0 the
+// step is the plain serial one the unit tests pin.
 fn proxyconf_pool_pick(pc: &ProxyConfig, pool_idx: u64) -> u64 {
+    if pc.cursor_mutex != 0 {
+        sa_sync_mutex_lock(pc.cursor_mutex);
+    };
     let count: u64 = pc.pool_server_counts[pool_idx];
     let at: u64 = proxyconf_pick_at(pc.pool_cursors[pool_idx], count);
     pc.pool_cursors[pool_idx] = pc.pool_cursors[pool_idx] + 1;
+    if pc.cursor_mutex != 0 {
+        sa_sync_mutex_unlock(pc.cursor_mutex);
+    };
     return pool_idx * PROXY_MAX_SERVERS + at;
 }

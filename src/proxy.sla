@@ -64,9 +64,10 @@ struct TextBuf {
     len: u64,
 }
 
-fn tb_new() -> TextBuf {
-    return TextBuf { bytes: [0u8; 1600], len: 0 };
-}
+// TextBuf values are constructed as struct literals at the use
+// site, never returned by value: a by-value return of this
+// 1608-byte struct materializes on the heap per call and is not
+// reclaimed (stage-2 slope fix; see docs/GOROUTINE_DELIVERY.md).
 
 fn tb_push(t: &TextBuf, src: ptr, n: u64) {
     let i: u64 = 0;
@@ -172,11 +173,11 @@ fn stats_key(pc: &ProxyConfig, pool_idx: u64, what: ptr, what_len: u64, out: &Te
 }
 
 fn stats_incr(pc: &ProxyConfig, dz: &DictZones, pool_idx: u64, what: ptr, what_len: u64, now: u64) {
-    let zname = tb_new();
+    let zname = TextBuf { bytes: [0u8; 1600], len: 0 };
     if stats_zone(dz, &zname) < 0 {
         return;
     };
-    let key = tb_new();
+    let key = TextBuf { bytes: [0u8; 1600], len: 0 };
     stats_key(pc, pool_idx, what, what_len, &key);
     let zp: ptr = PTR_BYTE_ADD(&zname.bytes, 0);
     let kp: ptr = PTR_BYTE_ADD(&key.bytes, 0);
@@ -185,11 +186,11 @@ fn stats_incr(pc: &ProxyConfig, dz: &DictZones, pool_idx: u64, what: ptr, what_l
 }
 
 fn stats_read(pc: &ProxyConfig, dz: &DictZones, pool_idx: u64, what: ptr, what_len: u64, now: u64) -> u64 {
-    let zname = tb_new();
+    let zname = TextBuf { bytes: [0u8; 1600], len: 0 };
     if stats_zone(dz, &zname) < 0 {
         return 0;
     };
-    let key = tb_new();
+    let key = TextBuf { bytes: [0u8; 1600], len: 0 };
     stats_key(pc, pool_idx, what, what_len, &key);
     let zp: ptr = PTR_BYTE_ADD(&zname.bytes, 0);
     let kp: ptr = PTR_BYTE_ADD(&key.bytes, 0);
@@ -203,7 +204,7 @@ fn stats_read(pc: &ProxyConfig, dz: &DictZones, pool_idx: u64, what: ptr, what_l
 // Body of the code-layer status route. Returns 0 when the
 // stats zone is declared (body built), 1 when it is not.
 fn proxy_status_body(pc: &ProxyConfig, dz: &DictZones, out: &TextBuf, now: u64) -> i32 {
-    let zname = tb_new();
+    let zname = TextBuf { bytes: [0u8; 1600], len: 0 };
     if stats_zone(dz, &zname) < 0 {
         return 1;
     };
@@ -247,7 +248,7 @@ fn proxy_forward_headers(req: ptr, ureq: ptr, peer: ptr, peer_len: u64, peer_kno
     forward_one_header(req, ureq, STR_PTR("user-agent"), STR_LEN("user-agent"));
     // x-forwarded-for: the client's own value (if any), extended
     // with this hop's peer address.
-    let xff = tb_new();
+    let xff = TextBuf { bytes: [0u8; 1600], len: 0 };
     let old: ptr = PTR_NULL();
     let old_len: u64 = 0;
     if sa_http_server_req_get_header(req, STR_PTR("x-forwarded-for"), STR_LEN("x-forwarded-for"), &old, &old_len) == 0 {
@@ -306,7 +307,7 @@ fn proxy_attempt(req: ptr, pc: &ProxyConfig, slot: u64,
                  peer: ptr, peer_len: u64, peer_known: bool) -> AttemptResult {
     let ar = AttemptResult { relayed: false, net_status: 6, status: 0, body_bytes: 0 };
     // URL: http://host:port<target>
-    let url = tb_new();
+    let url = TextBuf { bytes: [0u8; 1600], len: 0 };
     tb_push(&url, STR_PTR("http://"), STR_LEN("http://"));
     let hlen: u64 = pc.srv_host_lens[slot];
     let j: u64 = 0;
@@ -438,7 +439,7 @@ fn proxy_serve(req: ptr, pc: &ProxyConfig, dz: &DictZones,
     // NOT stripped (proxy_pass without a URI part).
     // raw_ptr/raw_len (the undecoded path) stay in the signature
     // for the access path's symmetry.
-    let target = tb_new();
+    let target = TextBuf { bytes: [0u8; 1600], len: 0 };
     tb_push_byte(&target, 47);
     tb_push(&target, norm_ptr, norm_len);
     if query_len > 0 {

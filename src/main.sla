@@ -23,9 +23,12 @@
 // resp_send_file_v2; static GET is served by sendfile, see the
 // GET path below).
 //
-// Process model: single process, sequential accept loop.
-// Handlers hold no state; cross-request state lives only in
-// declared shared dict zones (docs/HANDLER_MODEL.md).
+// Process model: single process; a dispatcher accepts requests
+// and hands each one to a per-connection goroutine supervised
+// inline (stage 2, docs/GOROUTINE_DELIVERY.md). Handlers hold no
+// state; cross-request state lives only in declared shared dict
+// zones (docs/HANDLER_MODEL.md), the boot-built server context,
+// and the dispatcher-owned slot table.
 
 @import "sa_std/http_server.sai"
 @import "sa_std/fs.sai"
@@ -34,6 +37,8 @@
 @import "sa_std/ptr.sa"
 @import "sa_std/string.sa"
 @import "sa_std/io/print.sai"
+@import "sa_std/task.sai"
+@import "sa_std/core/box.sa"
 @import "settings.sla"
 @import "config.sla"
 @import "webpath.sla"
@@ -56,14 +61,38 @@ struct Outcome {
     remote_len: u64,
 }
 
-fn outcome_new() -> Outcome {
-    return Outcome {
-        status: 0, body_bytes: 0,
-        method: [0u8; 16], method_len: 0,
-        path: [0u8; 1024], path_len: 0,
-        ua: [0u8; 256], ua_len: 0,
-        remote: [0u8; 64], remote_len: 0,
-    };
+// Reset an Outcome in place. The handler fills a caller-owned
+// Outcome (the dispatcher's slot) through &Outcome; this struct
+// used to be returned by value, which materialized ~1,424 bytes
+// on the heap per request, unreclaimed (stage-2 slope segment 1;
+// see docs/GOROUTINE_DELIVERY.md).
+fn outcome_init(o: &Outcome) {
+    o.status = 0;
+    o.body_bytes = 0;
+    o.method_len = 0;
+    o.path_len = 0;
+    o.ua_len = 0;
+    o.remote_len = 0;
+    let i: u64 = 0;
+    while i < 1024 {
+        o.path[i] = 0;
+        i = i + 1;
+    }
+    let j: u64 = 0;
+    while j < 256 {
+        o.ua[j] = 0;
+        j = j + 1;
+    }
+    let k: u64 = 0;
+    while k < 64 {
+        o.remote[k] = 0;
+        k = k + 1;
+    }
+    let m: u64 = 0;
+    while m < 16 {
+        o.method[m] = 0;
+        m = m + 1;
+    }
 }
 
 fn copy_capped_16(o: &Outcome, src: ptr, n: u64) {
@@ -134,8 +163,8 @@ fn send_simple(req: ptr, status: u16, body: ptr, body_len: u64) -> u64 {
     return body_len;
 }
 
-fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones) -> Outcome {
-    let o = outcome_new();
+fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones, o: &Outcome) {
+    outcome_init(o);
     // --- request line data ---
     let m_ptr: ptr = PTR_NULL();
     let m_len: u64 = 0;
@@ -144,15 +173,15 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones) -> O
     if sa_http_server_req_get_method(req, &m_ptr, &m_len) != 0 {
         o.status = 500;
         o.body_bytes = send_simple(req, 500, STR_PTR("internal error\n"), STR_LEN("internal error\n"));
-        return o;
+        return;
     };
     if sa_http_server_req_get_path(req, &p_ptr, &p_len) != 0 {
         o.status = 500;
         o.body_bytes = send_simple(req, 500, STR_PTR("internal error\n"), STR_LEN("internal error\n"));
-        return o;
+        return;
     };
-    copy_capped_16(&o, m_ptr, m_len);
-    copy_capped_1024(&o, p_ptr, p_len);
+    copy_capped_16(o, m_ptr, m_len);
+    copy_capped_1024(o, p_ptr, p_len);
     // --- query string (G4 backfill): the server face grew a
     // query getter; the proxy appends it to the forward target.
     // An absent query is ok with length 0. A getter failure is
@@ -166,9 +195,9 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones) -> O
     let ua_ptr: ptr = PTR_NULL();
     let ua_len: u64 = 0;
     if sa_http_server_req_get_header(req, STR_PTR("user-agent"), STR_LEN("user-agent"), &ua_ptr, &ua_len) == 0 {
-        copy_capped_256(&o, ua_ptr, ua_len);
+        copy_capped_256(o, ua_ptr, ua_len);
     } else {
-        copy_capped_256(&o, STR_PTR("-"), STR_LEN("-"));
+        copy_capped_256(o, STR_PTR("-"), STR_LEN("-"));
     };
     let is_get: bool = bytes_eq_lit(m_ptr, m_len, STR_PTR("GET"), STR_LEN("GET"));
     let is_head: bool = bytes_eq_lit(m_ptr, m_len, STR_PTR("HEAD"), STR_LEN("HEAD"));
@@ -183,52 +212,58 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones) -> O
     let peer_known: bool = false;
     if sa_http_server_req_peer_addr_v2(req, peer_ptr, 64, &peer_len, &peer_port) == 0 {
         peer_known = true;
-        copy_capped_64(&o, peer_ptr, peer_len);
+        copy_capped_64(o, peer_ptr, peer_len);
     } else {
-        copy_capped_64(&o, STR_PTR("-"), STR_LEN("-"));
+        copy_capped_64(o, STR_PTR("-"), STR_LEN("-"));
     };
     // --- code-layer ACL, evaluated per live request (G2) ---
+    // Decided over the peer's raw bytes (config_acl_allows_bytes
+    // mirrors the String predicate's decisions rule for rule);
+    // the String-building form cost ~6,277 B/request of
+    // unreclaimed temporaries (stage-2 slope segment 3).
     if peer_known {
-        let peer_str: String = peer_text_to_string(peer_ptr, peer_len);
-        if !config_acl_allows(peer_str) {
+        if !config_acl_allows_bytes(peer_ptr, peer_len) {
             o.status = 403;
             o.body_bytes = send_simple(req, 403, STR_PTR("forbidden\n"), STR_LEN("forbidden\n"));
-            return o;
+            return;
         };
     };
     // --- path resolution (decode + normalize + containment) ---
-    let resolved = resolved_new();
+    // Literal local, filled through &ResolvedPath by
+    // webpath_resolve: a by-value resolved_new() return was part
+    // of the stage-2 slope segment 2 (large-struct materialization).
+    let resolved = ResolvedPath { bytes: [0u8; 1024], len: 0, ended_with_slash: false };
     let rrc: i32 = webpath_resolve(p_ptr, p_len, &resolved);
     if rrc == 1 {
         o.status = 403;
         o.body_bytes = send_simple(req, 403, STR_PTR("forbidden\n"), STR_LEN("forbidden\n"));
-        return o;
+        return;
     };
     if rrc != 0 {
         o.status = 400;
         o.body_bytes = send_simple(req, 400, STR_PTR("bad request\n"), STR_LEN("bad request\n"));
-        return o;
+        return;
     };
     let norm_ptr: ptr = PTR_BYTE_ADD(&resolved.bytes, 0);
     // --- code-layer deny rule ---
     if config_path_denied(norm_ptr, resolved.len) {
         o.status = 403;
         o.body_bytes = send_simple(req, 403, STR_PTR("forbidden\n"), STR_LEN("forbidden\n"));
-        return o;
+        return;
     };
     // --- code-layer status route: shared dict readout ---
     if is_get {
         if bytes_eq_lit(norm_ptr, resolved.len, STR_PTR("__slanginx/status"), STR_LEN("__slanginx/status")) {
-            let body = tb_new();
+            let body = TextBuf { bytes: [0u8; 1600], len: 0 };
             if proxy_status_body(pc, dz, &body, dict_now()) == 0 {
                 let body_ptr: ptr = PTR_BYTE_ADD(&body.bytes, 0);
                 o.status = 200;
                 o.body_bytes = send_simple(req, 200, body_ptr, body.len);
-                return o;
+                return;
             };
             o.status = 404;
             o.body_bytes = send_simple(req, 404, STR_PTR("not found\n"), STR_LEN("not found\n"));
-            return o;
+            return;
         };
     };
     // --- reverse-proxy routes (M1) ---
@@ -243,7 +278,7 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones) -> O
                              dict_now());
         o.status = pr.status;
         o.body_bytes = pr.body_bytes;
-        return o;
+        return;
     };
     // --- method gate for the static face (proxy routes accept
     // their own method set inside proxy.sla; the deny rule and
@@ -262,7 +297,7 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones) -> O
                 };
                 sa_http_server_resp_free_v2(resp);
             };
-            return o;
+            return;
         };
     };
     // --- code-layer routing: pick the root, strip the alias prefix ---
@@ -281,7 +316,8 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones) -> O
     let cand: [u8; 1400] = [0u8; 1400];
     let cand_len: u64 = 0;
     if use_assets {
-        let ar = config_assets_root();
+        let ar = AssetsRoot { bytes: [0u8; 128], len: 0 };
+        config_assets_root_into(&ar);
         let i: u64 = 0;
         while i < ar.len {
             cand[cand_len] = ar.bytes[i];
@@ -333,7 +369,7 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones) -> O
         if need_index {
             o.status = 404;
             o.body_bytes = send_simple(req, 404, STR_PTR("not found\n"), STR_LEN("not found\n"));
-            return o;
+            return;
         };
         // Maybe a directory addressed without a trailing slash:
         // retry with /<index> appended (served directly; M0 does
@@ -350,11 +386,11 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones) -> O
         if sa_std_fs_len(cand_ptr, cand_len, &file_len) != 0 {
             o.status = 404;
             o.body_bytes = send_simple(req, 404, STR_PTR("not found\n"), STR_LEN("not found\n"));
-            return o;
+            return;
         };
     };
     // --- content type by extension ---
-    let mime = mime_new();
+    let mime = MimeType { bytes: [0u8; 40], len: 0 };
     webpath_mime(cand_ptr, cand_len, &mime);
     let mime_ptr: ptr = PTR_BYTE_ADD(&mime.bytes, 0);
     // --- HEAD: headers only, no body bytes on the wire ---
@@ -368,7 +404,7 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones) -> O
         o.status = 200;
         if sa_http_server_resp_new_v2(req, 200, &resp) != 0 {
             o.status = 500;
-            return o;
+            return;
         };
         sa_http_server_resp_add_header_v2(resp, STR_PTR("content-type"), STR_LEN("content-type"), mime_ptr, mime.len);
         if sa_http_server_resp_send_head_v2(resp, file_len, 5000) != 0 {
@@ -376,7 +412,7 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones) -> O
         };
         sa_http_server_resp_free_v2(resp);
         o.body_bytes = 0;
-        return o;
+        return;
     };
     // --- GET: sendfile from disk (G3') ---
     // The server face grew a send-file response shape
@@ -394,21 +430,21 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones) -> O
     if sa_std_fs_open_read(cand_ptr, cand_len, &fh) != 0 {
         o.status = 404;
         o.body_bytes = send_simple(req, 404, STR_PTR("not found\n"), STR_LEN("not found\n"));
-        return o;
+        return;
     };
     let raw_fd: i32 = -1;
     if sa_std_fd_as_raw(fh, &raw_fd) != 0 {
         sa_fs_file_close(fh);
         o.status = 500;
         o.body_bytes = send_simple(req, 500, STR_PTR("internal error\n"), STR_LEN("internal error\n"));
-        return o;
+        return;
     };
     let resp: ptr = PTR_NULL();
     if sa_http_server_resp_new_v2(req, 200, &resp) != 0 {
         sa_fs_file_close(fh);
         o.status = 500;
         o.body_bytes = 0;
-        return o;
+        return;
     };
     sa_http_server_resp_add_header_v2(resp, STR_PTR("content-type"), STR_LEN("content-type"), mime_ptr, mime.len);
     let sent: u64 = 0;
@@ -425,14 +461,14 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones) -> O
         println("slanginx: sendfile unsupported on this platform; static GET answered 500");
         o.status = 500;
         o.body_bytes = send_simple(req, 500, STR_PTR("internal error\n"), STR_LEN("internal error\n"));
-        return o;
+        return;
     };
     // Any other nonzero status means the response was committed
     // and fell short (e.g. the file shrank after being measured):
     // body_bytes already reports the bytes that actually reached
     // the wire, and the connection is closed by the face because
     // the framing did not complete.
-    return o;
+    return;
 }
 
 struct ConfigPath {
@@ -468,6 +504,500 @@ fn env_config_path() -> ConfigPath {
     };
     sa_env_buffer_free(eb);
     return cp;
+}
+
+// ----------------------------------------------------------------
+// ----------------------------------------------------------------
+// Stage-2 serve model (docs/GOROUTINE_DELIVERY.md)
+//
+// A single dispatcher (the main task) owns the slot table,
+// the access-log sink, and trap accounting. It accepts
+// requests itself (short poll), and for each request spawns
+// the worker directly under the runtime's supervised
+// boundary (go supervised); the worker runs the ordinary
+// sequential handle_request for exactly one request, reports
+// its slot on the completions channel, and the dispatcher
+// joins the finished task when it recycles the slot, reading
+// back any trap record then. Workers touch only their own
+// slot's Outcome (filled in place), the read-only boot
+// configuration, the globals-backed dict zones (internally
+// serialized by sa_std), and the proxy cursor (mutex-guarded
+// since this batch, see upstream.sla).
+//
+// Two measured runtime behaviors shape this design:
+//
+// (1) No supervisor goroutine. The per-connection supervisor
+// shape (a supervisor task performing the spawn+join per
+// request) panics the runtime after ~300k cumulative cycles
+// on the current toolchain (PANIC code=60901, "reached
+// unreachable code"; minimal repros probe_h5/probe_h6: the
+// supervised and the plain variant die at the same count,
+// while the same spawn+join cycle driven from the main task
+// passes 705k cycles, probe_h7). The lethal ingredient is
+// spawn/join driven from a non-main task, so every spawn and
+// join lives on the main task; the supervision semantics
+// (supervised boundary, per-slot trap record, dispatcher-side
+// intensity accounting) are unchanged. A trapped worker
+// never sends its completion (defer does not run on trap --
+// probe_h7t2), so the dispatcher also runs a watchdog: a
+// slot in flight far beyond any legitimate request lifetime
+// is joined in place (instant for a trapped or finished
+// worker) and recycled through the same trap path; see
+// watchdog_scan.
+//
+// (2) Accept is pumped by the main task. Feeding the
+// dispatcher from a separate acceptor goroutine stalls
+// request delivery for seconds at a time under sustained
+// load on the current toolchain (the whole process parks,
+// zero CPU, while requests sit undelivered; the identical
+// server with main-task accept sustains full rate with zero
+// errors over 120k requests -- line diag runs, 2026-10-30).
+// The std server face evidently expects its accept entry to
+// be driven from the consumer's own loop, as the sequential
+// model did. The dispatcher therefore accepts in its own
+// loop with a short poll (ACCEPT_POLL_MS), which also keeps
+// completion draining ahead of new work by construction.
+// The poll slice quantizes single-connection latency (the
+// face does not return early for queued keep-alive requests:
+// measured c1 p50 ~= the poll slice), so the slice is 1 ms:
+// c1 780 rps / p99 1.7 ms at 1 ms vs 186 rps / p99 5.6 ms at
+// 5 ms, c10 throughput unchanged (~5.6k rps both).
+//
+// Generational rotation bounds the loop stack ratchet (a
+// codegen-level defect tracked separately: loop-body
+// stack_alloc does not rewind per iteration, ~13-16
+// B/iteration on a long-lived loop's stack; the main task
+// dies at RLIMIT_STACK, default 8 MiB, after ~523k
+// accept-loop iterations). The dispatcher consumes
+// GEN_EVENT_BUDGET = 20,000 events per generation (at even
+// 128 B/event of ratchet that is 2.56 MB, under a third of
+// the 8 MiB main stack), then stops dispatching, drains
+// in-flight work, and returns to serve(), which immediately
+// calls the next generation on a fresh frame. Spawned
+// workers run exactly one request, so their frames never
+// loop and need no rotation.
+//
+// Trap policy: a trapped worker never kills the process by
+// itself -- its slot completes with the recorded outcome (a
+// synthetic 500 when the trap hit before any status was set)
+// and the request is logged and freed as usual. More than
+// TRAP_LIMIT traps inside TRAP_WINDOW_S seconds means the
+// process is sick, not unlucky: the dispatcher fails loudly
+// (exit code 3) instead of serving on silently.
+// ----------------------------------------------------------------
+
+const CONN_SLOTS: u64 = 64;
+const GEN_EVENT_BUDGET: u64 = 20000;
+const TRAP_LIMIT: u64 = 32;
+const TRAP_WINDOW_S: u64 = 60;
+const ACCEPT_POLL_MS: u32 = 1;
+// Watchdog reaping ages for stuck slots (see watchdog_scan).
+// The std fetch cap is 180 s, so any request older than that
+// is either trapped, wedged, or a sendfile to an extremely
+// slow reader; the routine bound (1,800 s) declares it
+// wedged -- a reader slower than ~120 B/s on the largest
+// file is indistinguishable from a wedge, and the join stall
+// is bounded by that transfer's remainder. When no slot is
+// free the dispatcher is not serving anyway, so the
+// aggressive bound (300 s) applies: joining a trapped worker
+// returns at once, and joining a merely slow one can only
+// stall a dispatcher that is already stalled.
+const TRAP_REAP_AFTER_S: u64 = 300;
+const TRAP_REAP_MAX_S: u64 = 1800;
+
+struct ServerCtx {
+    settings: Settings,
+    proxy: ProxyConfig,
+    zones: DictZones,
+    sink: LogSink,
+    srv: ptr,
+    completions: Chan<u64>,
+    slots: [*ConnSlot; 64],
+}
+
+struct ConnSlot {
+    idx: u64,
+    req: ptr,
+    outcome: Outcome,
+    trapped: bool,
+    trap_code: i32,
+    // Dispatcher-side supervision state: the supervised task
+    // handle, whether a request is in flight, its dispatch
+    // time (dict_now seconds), and a per-slot dispatch
+    // sequence number. The completion payload packs idx and
+    // seq so the dispatcher can recognize a stale completion
+    // (one whose slot the watchdog already reaped).
+    handle: u64,
+    busy: bool,
+    started: u64,
+    seq: u64,
+}
+
+struct ConnJob {
+    ctx: *ServerCtx,
+    slot: *ConnSlot,
+}
+
+fn conn_slot_new(idx: u64) -> *ConnSlot {
+    return Box::into_raw(Box::new(ConnSlot {
+        idx: idx, req: PTR_NULL(),
+        outcome: Outcome {
+            status: 0, body_bytes: 0,
+            method: [0u8; 16], method_len: 0,
+            path: [0u8; 1024], path_len: 0,
+            ua: [0u8; 256], ua_len: 0,
+            remote: [0u8; 64], remote_len: 0,
+        },
+        trapped: false, trap_code: 0,
+        handle: 0, busy: false, started: 0, seq: 0,
+    }));
+}
+
+// The per-connection worker: run handle_request for exactly
+// one request, report the slot on the completions channel
+// (payload packs the slot idx and its dispatch sequence), and
+// reclaim the job box. If the worker traps, the completion is
+// never sent -- the dispatcher's watchdog reaps the slot by
+// joining this task's handle (see watchdog_scan).
+fn conn_worker(job: *ConnJob) {
+    let ctx: *ServerCtx = (*job).ctx;
+    let slot: *ConnSlot = (*job).slot;
+    let payload: u64 = (*slot).idx * 4294967296 + ((*slot).seq % 4294967296);
+    handle_request((*slot).req, &(*ctx).settings, &(*ctx).proxy, &(*ctx).zones, &(*slot).outcome);
+    (*ctx).completions.send(payload);
+    let reclaimed = unsafe { Box::from_raw(job) };
+}
+
+// Join a slot's supervised task if it has not been joined
+// yet, recording any trap in the slot. Called by the
+// dispatcher when a slot is recycled (the common path: the
+// worker already exited, so the join returns at once) and by
+// the watchdog (the trap path: the worker trapped and never
+// sent its completion).
+fn join_slot_task(ctx: *ServerCtx, idx: u64) {
+    let slot: *ConnSlot = (*ctx).slots[idx];
+    let h: u64 = (*slot).handle;
+    if h != 0 {
+        (*slot).handle = 0;
+        let st = sa_task_join(h);
+        if st == 100 {
+            (*slot).trapped = true;
+            let code: i32 = 0;
+            let msg_ptr: ptr = PTR_NULL();
+            let msg_len: u64 = 0;
+            if sa_task_trap_info(h, &code, &msg_ptr, &msg_len) == 0 {
+                (*slot).trap_code = code;
+            };
+        };
+    };
+}
+
+struct TrapState {
+    count: u64,
+    window_start: u64,
+}
+
+// Dispatcher-side completion handling for one finished slot:
+// join the slot's task (collecting any trap record), append
+// the access-log line for the recorded outcome, account the
+// trap (if any) against the intensity limit, and free the
+// request handle. Returns 3 when the trap intensity limit is
+// breached -- serve() then fails the process loudly.
+fn recycle_completion(ctx: *ServerCtx, idx: u64, traps: &TrapState) -> i32 {
+    let slot: *ConnSlot = (*ctx).slots[idx];
+    join_slot_task(ctx, idx);
+    (*slot).busy = false;
+    let status: u32 = (*slot).outcome.status;
+    if (*slot).trapped {
+        if status == 0 {
+            status = 500;
+        };
+        let now: u64 = dict_now();
+        if now >= traps.window_start + TRAP_WINDOW_S {
+            traps.window_start = now;
+            traps.count = 0;
+        };
+        traps.count = traps.count + 1;
+    };
+    access_log_append(&(*ctx).sink,
+                      PTR_BYTE_ADD(&(*slot).outcome.remote, 0), (*slot).outcome.remote_len,
+                      PTR_BYTE_ADD(&(*slot).outcome.method, 0), (*slot).outcome.method_len,
+                      PTR_BYTE_ADD(&(*slot).outcome.path, 0), (*slot).outcome.path_len,
+                      status, (*slot).outcome.body_bytes,
+                      PTR_BYTE_ADD(&(*slot).outcome.ua, 0), (*slot).outcome.ua_len);
+    sa_http_server_req_free_v2((*slot).req);
+    (*slot).req = PTR_NULL();
+    if (*slot).trapped {
+        if traps.count > TRAP_LIMIT {
+            return 3;
+        };
+    };
+    return 0;
+}
+
+// One dispatcher generation's mutable bookkeeping (the free
+// slot stack, in-flight count, event count), passed by
+// reference to the recycle/watchdog helpers.
+struct GenBook {
+    free_stack: [u64; 64],
+    free_top: u64,
+    in_flight: u64,
+    events: u64,
+}
+
+// Process one completion payload: decode (idx, seq); a stale
+// payload (the watchdog already reaped that dispatch) is
+// dropped without touching the books. Otherwise recycle the
+// slot and return it to the free stack.
+fn book_recycle(ctx: *ServerCtx, book: &GenBook, payload: u64, traps: &TrapState) -> i32 {
+    let idx: u64 = payload / 4294967296;
+    let seq: u64 = payload % 4294967296;
+    let slot: *ConnSlot = (*ctx).slots[idx];
+    if seq != (*slot).seq % 4294967296 {
+        return 0;
+    };
+    if !(*slot).busy {
+        return 0;
+    };
+    let rc = recycle_completion(ctx, idx, traps);
+    book.in_flight = book.in_flight - 1;
+    book.free_stack[book.free_top] = idx;
+    book.free_top = book.free_top + 1;
+    return rc;
+}
+
+// Watchdog: reap slots whose request has been in flight far
+// beyond any legitimate lifetime (see the TRAP_REAP_*
+// constants). The worker in such a slot has trapped -- its
+// completion never arrives because defer does not run on
+// trap (probe_h7t2) -- or is wedged. recycle_completion
+// joins the task in place: instant for a trapped or finished
+// worker. The slot's seq is bumped first, so a completion
+// the worker did manage to queue becomes stale and is
+// dropped by book_recycle instead of double-recycling.
+fn watchdog_scan(ctx: *ServerCtx, book: &GenBook, traps: &TrapState) -> i32 {
+    let now: u64 = dict_now();
+    let age_limit: u64 = TRAP_REAP_MAX_S;
+    if book.free_top == 0 {
+        age_limit = TRAP_REAP_AFTER_S;
+    };
+    let i: u64 = 0;
+    while i < CONN_SLOTS {
+        let slot: *ConnSlot = (*ctx).slots[i];
+        if (*slot).busy {
+            if now >= (*slot).started + age_limit {
+                (*slot).seq = (*slot).seq + 1;
+                let rc = recycle_completion(ctx, i, traps);
+                book.in_flight = book.in_flight - 1;
+                book.free_stack[book.free_top] = i;
+                book.free_top = book.free_top + 1;
+                if rc != 0 {
+                    return rc;
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return 0;
+}
+
+struct RecvBox {
+    payload: u64,
+    got: bool,
+    closed: bool,
+}
+
+// Non-blocking completion receive (select/default).
+//
+// The dispatcher's channel waits use ONLY the select shapes:
+// it never calls Chan::len() (a len() call in a nested
+// while-condition after receives parks the task on the current
+// toolchain — minimal repros in ~/workspace/sx-work/chan-len-hang/:
+// the len-in-condition form hangs deterministically, the
+// len-in-body and select shapes pass).
+fn try_recv_completion(ctx: *ServerCtx, out: &RecvBox) {
+    out.payload = 0;
+    out.got = false;
+    out.closed = false;
+    select {
+        case let (v, closed) = (*ctx).completions.recv() {
+            out.payload = v;
+            out.got = true;
+            out.closed = closed;
+        }
+        default {
+            out.got = false;
+        }
+    }
+}
+
+struct SelectBox {
+    kind: u64,
+    idx: u64,
+    req: ptr,
+    closed: bool,
+}
+
+// Blocking completion wait in 1 s slices: kind 1 = a
+// completion arrived (idx holds the packed payload), kind 3
+// = the slice timed out (the caller runs the watchdog).
+fn select_completion(ctx: *ServerCtx, out: &SelectBox) {
+    out.kind = 0;
+    out.idx = 0;
+    out.req = PTR_NULL();
+    out.closed = false;
+    select {
+        case let (v, closed) = (*ctx).completions.recv() {
+            out.kind = 1;
+            out.idx = v;
+            out.closed = closed;
+        }
+        timeout(1000000000) {
+            out.kind = 3;
+        }
+    }
+}
+
+// Bind a request handle to a free slot and spawn its worker
+// under the supervised boundary; the task handle, dispatch
+// time, and sequence number stay in the slot for the
+// dispatcher's recycle/watchdog joins. Slot free-stack
+// bookkeeping stays with the caller.
+fn start_request(ctx: *ServerCtx, slot_idx: u64, req: ptr) {
+    let slot: *ConnSlot = (*ctx).slots[slot_idx];
+    (*slot).req = req;
+    (*slot).trapped = false;
+    (*slot).trap_code = 0;
+    (*slot).seq = (*slot).seq + 1;
+    (*slot).started = dict_now();
+    (*slot).busy = true;
+    outcome_init(&(*slot).outcome);
+    let job = Box::into_raw(Box::new(ConnJob { ctx: ctx, slot: slot }));
+    let h = go supervised conn_worker(job);
+    (*slot).handle = h;
+}
+
+// One dispatcher generation: consume up to GEN_EVENT_BUDGET
+// events (dispatches + completion recycles), then stop
+// dispatching, drain in-flight completions, and return 0
+// (serve() starts the next generation on a fresh frame).
+// Each iteration first drains every queued completion
+// (non-blocking), so recycling always runs ahead of new
+// accepts; the watchdog runs on a ~1 Hz cadence (checked on
+// loop iterations and on the blocking waits' timeout
+// slices). Returns 3 on a trap intensity breach or an
+// (impossible by construction) channel close. Slot count
+// and the free-stack array size are the same constant by
+// construction (CONN_SLOTS == 64).
+fn serve_generation(ctx: *ServerCtx) -> i32 {
+    let book = GenBook { free_stack: [0; 64], free_top: 0, in_flight: 0, events: 0 };
+    let i: u64 = 0;
+    while i < CONN_SLOTS {
+        book.free_stack[book.free_top] = CONN_SLOTS - 1 - i;
+        book.free_top = book.free_top + 1;
+        i = i + 1;
+    }
+    let traps = TrapState { count: 0, window_start: dict_now() };
+    let iter: u64 = 0;
+    let last_scan: u64 = dict_now();
+    while true {
+        iter = iter + 1;
+        if iter % 1024 == 0 {
+            let now2: u64 = dict_now();
+            if now2 != last_scan {
+                last_scan = now2;
+                let rcw0 = watchdog_scan(ctx, &book, &traps);
+                if rcw0 != 0 {
+                    return rcw0;
+                };
+            };
+        };
+        // Drain every queued completion first.
+        let progressed: bool = true;
+        while progressed {
+            let rb = RecvBox { payload: 0, got: false, closed: false };
+            try_recv_completion(ctx, &rb);
+            if rb.closed {
+                return 3;
+            };
+            if !rb.got {
+                progressed = false;
+            } else {
+                let rcd = book_recycle(ctx, &book, rb.payload, &traps);
+                if rcd != 0 {
+                    return rcd;
+                };
+                book.events = book.events + 1;
+            };
+        }
+        if book.events >= GEN_EVENT_BUDGET {
+            // Draining for a generation change.
+            if book.in_flight == 0 {
+                return 0;
+            };
+            let sb = SelectBox { kind: 0, idx: 0, req: PTR_NULL(), closed: false };
+            select_completion(ctx, &sb);
+            if sb.closed {
+                return 3;
+            };
+            if sb.kind == 1 {
+                let rc = book_recycle(ctx, &book, sb.idx, &traps);
+                if rc != 0 {
+                    return rc;
+                };
+            } else {
+                let rcw = watchdog_scan(ctx, &book, &traps);
+                if rcw != 0 {
+                    return rcw;
+                };
+            };
+        } else {
+            if book.free_top == 0 {
+                // All slots busy: park on the next completion.
+                let sb2 = SelectBox { kind: 0, idx: 0, req: PTR_NULL(), closed: false };
+                select_completion(ctx, &sb2);
+                if sb2.closed {
+                    return 3;
+                };
+                if sb2.kind == 1 {
+                    let rc2 = book_recycle(ctx, &book, sb2.idx, &traps);
+                    if rc2 != 0 {
+                        return rc2;
+                    };
+                    book.events = book.events + 1;
+                } else {
+                    let rcw2 = watchdog_scan(ctx, &book, &traps);
+                    if rcw2 != 0 {
+                        return rcw2;
+                    };
+                };
+            } else {
+                let req: ptr = PTR_NULL();
+                let ast: u32 = sa_http_server_accept_v2((*ctx).srv, ACCEPT_POLL_MS, &req);
+                if ast == 0 {
+                    book.free_top = book.free_top - 1;
+                    start_request(ctx, book.free_stack[book.free_top], req);
+                    book.in_flight = book.in_flight + 1;
+                    book.events = book.events + 1;
+                };
+            };
+        };
+    }
+    return 0;
+}
+
+// Generation supervisor: run dispatcher generations back to
+// back on fresh frames, forever; a nonzero generation result
+// (trap intensity breach) is a loud process failure.
+fn serve(ctx: *ServerCtx) -> i32 {
+    while true {
+        let rc = serve_generation(ctx);
+        if rc != 0 {
+            println("slanginx: trap intensity limit exceeded; failing loudly");
+            return rc;
+        };
+    }
+    return 0;
 }
 
 fn main() -> i32 {
@@ -538,25 +1068,28 @@ fn main() -> i32 {
     // The effective listen address is the config's; the
     // acceptance harness verifies it over HTTP.
     println("slanginx: listening (address and root from config)");
-    // --- accept loop ---
-    let spinning: bool = true;
-    while spinning {
-        let req: ptr = PTR_NULL();
-        let ast: u32 = sa_http_server_accept_v2(srv, 30000, &req);
-        if ast == 0 {
-            let o = handle_request(req, &s, &pc, &dz);
-            let m_ptr2: ptr = PTR_BYTE_ADD(&o.method, 0);
-            let p_ptr2: ptr = PTR_BYTE_ADD(&o.path, 0);
-            let ua_ptr2: ptr = PTR_BYTE_ADD(&o.ua, 0);
-            let r_ptr2: ptr = PTR_BYTE_ADD(&o.remote, 0);
-            access_log_append(&sink,
-                              r_ptr2, o.remote_len,
-                              m_ptr2, o.method_len,
-                              p_ptr2, o.path_len,
-                              o.status, o.body_bytes,
-                              ua_ptr2, o.ua_len);
-            sa_http_server_req_free_v2(req);
-        };
+    // --- stage-2 serve model: install the proxy cursor mutex,
+    // build the Box-owned server context (process-lifetime,
+    // deliberately never freed: connection goroutines reach it
+    // by raw pointer), create the slot pool, and hand over to
+    // the dispatcher (see the serve section above). ---
+    let mh: u64 = 0;
+    if sa_sync_mutex_new(&mh) != 0 {
+        println("slanginx: cursor mutex create failed");
+        return 3;
+    };
+    pc.cursor_mutex = mh;
+    let completions: Chan<u64> = Chan::new(64);
+    let slot0 = conn_slot_new(0);
+    let ctx = Box::into_raw(Box::new(ServerCtx {
+        settings: s, proxy: pc, zones: dz, sink: sink, srv: srv,
+        completions: completions,
+        slots: [slot0; 64],
+    }));
+    let si: u64 = 1;
+    while si < CONN_SLOTS {
+        (*ctx).slots[si] = conn_slot_new(si);
+        si = si + 1;
     }
-    return 0;
+    return serve(ctx);
 }
