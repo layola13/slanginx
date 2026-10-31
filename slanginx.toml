@@ -11,6 +11,14 @@ root = "www"
 index = "index.html"
 access_log = "logs/access.log"
 max_file_bytes = 33554432
+# Serve model (round 2): "dispatch" = the stage-2 dispatcher
+# hands each request to a per-request goroutine; "merged" =
+# a fixed set of long-lived workers accepts and serves directly
+# (no per-request spawn). workers = the merged model's worker
+# count (1..64, default 4); pair it with SA_TASK_CARRIERS >=
+# workers + 4 in the launch environment. Defaults: dispatch, 4.
+# serve_model = "merged"
+# workers = 4
 
 # Shared dict zones (M1, docs/HANDLER_MODEL.md model A): the only
 # cross-request state in the server. Declared here, reached from

@@ -19,6 +19,8 @@
 //   index = "index.html"        (string)
 //   access_log = "logs/access.log" (string)
 //   max_file_bytes = 33554432   (integer)
+//   workers = 4                 (integer, merged serve model)
+//   serve_model = "dispatch"    (string: "dispatch" | "merged")
 
 @import "sa_std/encoding/toml.sai"
 @import "sa_std/encoding/toml.sla"
@@ -39,6 +41,13 @@ struct Settings {
     log_path: [u8; 512],
     log_len: u64,
     max_file_bytes: u64,
+    // Round-2 dispatch model (docs in src/main.sla serve section):
+    // serve_model selects the stage-2 dispatcher ("dispatch") or
+    // the merged worker-accepts model ("merged"); workers is the
+    // merged model's worker count (1..64).
+    workers: u64,
+    serve_model: [u8; 16],
+    serve_model_len: u64,
 }
 
 // settings_load result codes:
@@ -83,6 +92,15 @@ fn copy_lit_log(s: &Settings, lit: ptr, lit_len: u64) {
     s.log_len = lit_len;
 }
 
+fn copy_lit_model(s: &Settings, lit: ptr, lit_len: u64) {
+    let i: u64 = 0;
+    while i < lit_len {
+        s.serve_model[i] = PTR_BYTE_AT(lit, i);
+        i = i + 1;
+    }
+    s.serve_model_len = lit_len;
+}
+
 fn settings_blank() -> Settings {
     let s = Settings {
         host: [0u8; 64], host_len: 0, port: 8080,
@@ -90,16 +108,20 @@ fn settings_blank() -> Settings {
         index: [0u8; 128], index_len: 0,
         log_path: [0u8; 512], log_len: 0,
         max_file_bytes: 33554432,
+        workers: 4,
+        serve_model: [0u8; 16], serve_model_len: 0,
     };
     copy_lit_host(&s, STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1"));
     copy_lit_root(&s, STR_PTR("www"), STR_LEN("www"));
     copy_lit_index(&s, STR_PTR("index.html"), STR_LEN("index.html"));
     copy_lit_log(&s, STR_PTR("logs/access.log"), STR_LEN("logs/access.log"));
+    copy_lit_model(&s, STR_PTR("dispatch"), STR_LEN("dispatch"));
     return s;
 }
 
 // Apply one string key into the field selected by `tag`
-// (0=host, 1=root, 2=index, 3=log_path). Returns 0 ok / 3 type error.
+// (0=host, 1=root, 2=index, 3=log_path, 4=serve_model).
+// Returns 0 ok / 3 type error.
 // A missing key is not an error: the default stays.
 fn apply_string_key(s: &Settings, doc: u64, path: ptr, path_len: u64, tag: u32, cap: u64) -> i32 {
     let kind: u32 = 0;
@@ -146,13 +168,37 @@ fn apply_string_key(s: &Settings, doc: u64, path: ptr, path_len: u64, tag: u32, 
         s.index_len = v_len;
         return 0;
     };
+    if tag == 3 {
+        let i: u64 = 0;
+        while i < v_len {
+            s.log_path[i] = PTR_BYTE_AT(v_ptr, i);
+            i = i + 1;
+        }
+        s.log_len = v_len;
+        return 0;
+    };
     let i: u64 = 0;
     while i < v_len {
-        s.log_path[i] = PTR_BYTE_AT(v_ptr, i);
+        s.serve_model[i] = PTR_BYTE_AT(v_ptr, i);
         i = i + 1;
     }
-    s.log_len = v_len;
+    s.serve_model_len = v_len;
     return 0;
+}
+
+// serve_model accepts exactly "dispatch" or "merged".
+fn model_bytes_eq(s: &Settings, lit: ptr, lit_len: u64) -> bool {
+    if s.serve_model_len != lit_len {
+        return false;
+    };
+    let i: u64 = 0;
+    while i < lit_len {
+        if s.serve_model[i] != PTR_BYTE_AT(lit, i) {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
 }
 
 fn settings_load(s: &Settings, pc: &ProxyConfig, dz: &DictZones, cfg_ptr: ptr, cfg_len: u64) -> i32 {
@@ -223,6 +269,46 @@ fn settings_load(s: &Settings, pc: &ProxyConfig, dz: &DictZones, cfg_ptr: ptr, c
                     } else {
                         s.max_file_bytes = v as u64;
                     };
+                };
+            };
+        };
+    };
+    if rc == 0 {
+        // workers: optional integer in 1..64 (merged model)
+        let kind: u32 = 0;
+        let st: i32 = sa_toml_kind(doc, STR_PTR("server.workers"), STR_LEN("server.workers"), &kind);
+        if st == 0 {
+            if kind != SA_TOML_KIND_INTEGER {
+                rc = 3;
+            } else {
+                let v: i64 = 0;
+                let gst: i32 = sa_toml_get_i64(doc, STR_PTR("server.workers"), STR_LEN("server.workers"), &v);
+                if gst != 0 {
+                    rc = 3;
+                } else {
+                    if v < 1 {
+                        rc = 3;
+                    } else {
+                        if v > 64 {
+                            rc = 3;
+                        } else {
+                            s.workers = v as u64;
+                        };
+                    };
+                };
+            };
+        };
+    };
+    if rc == 0 {
+        // serve_model: optional string, exactly "dispatch" or
+        // "merged"; anything else is a startup error (rc 3).
+        rc = apply_string_key(s, doc, STR_PTR("server.serve_model"), STR_LEN("server.serve_model"), 4, 16);
+        if rc == 0 {
+            if model_bytes_eq(s, STR_PTR("dispatch"), STR_LEN("dispatch")) {
+            } else {
+                if model_bytes_eq(s, STR_PTR("merged"), STR_LEN("merged")) {
+                } else {
+                    rc = 3;
                 };
             };
         };

@@ -629,6 +629,14 @@ struct ServerCtx {
     srv: ptr,
     completions: Chan<u64>,
     slots: [*ConnSlot; 64],
+    // Round-2 merged serve model fields (used only when
+    // merged is true; the dispatch model never touches them).
+    results: Chan<u64>,
+    workers: [*WorkerState; 64],
+    log_mutex: u64,
+    worker_count: u64,
+    merged: bool,
+    debug_sup: bool,
 }
 
 struct ConnSlot {
@@ -1057,6 +1065,382 @@ fn serve(ctx: *ServerCtx) -> i32 {
     return 0;
 }
 
+// ----------------------------------------------------------------
+// Round-2 merged serve model (b1; design package
+// slanginx-r2 DESIGN.md sections 5(b1)/7, supervision shape
+// ruled by Jev: per-incarnation join, adopt_per_incarnation_join
+// 0.99).
+//
+// W long-lived worker tasks each run the accept loop themselves
+// on the shared server handle: accept_v2 (50 ms slice -- the
+// slice is also the fresh-connection head-parse budget inside
+// the face, so the merged model's longer slice widens that
+// budget from the dispatcher's 1 ms) -> handle_request ->
+// release the request handle themselves -> append their own
+// access-log line under the log mutex (sub-shape alpha: the
+// sink's staging buffer is part of the sink state, so the
+// mutex covers line assembly as well as the write). There is
+// no per-request spawn, no completion channel, and no central
+// serial line: the connection pool's own multi-consumer design
+// (pool lock + self-wake pipe in the std face) hands each
+// ready connection to whichever worker accepts first, which is
+// the "pool does overload transfer" property of the merged
+// model, for free.
+//
+// Supervision moves from per-request join to per-incarnation
+// join: a worker serves WORKER_REQ_BUDGET requests (bounding
+// the loop-body stack ratchet the same way the dispatcher's
+// generational budget does), exits normally, and is respawned
+// by the supervisor. Each worker has a monitor task whose only
+// job is to join that incarnation and report the outcome
+// (normal exit with its served count, or trap with its trap
+// code) on the results channel; the supervisor accounts traps
+// against the same intensity policy as the dispatch model
+// (more than TRAP_LIMIT inside TRAP_WINDOW_S seconds fails the
+// process loudly, exit 3) and respawns the worker. Spawn+join
+// driven from these monitor tasks is legal on the current
+// toolchain (the 60901 non-main ceiling was retested gone by
+// the design line: 1.2M cycles from a non-main driver, rc=0).
+//
+// Trap containment difference vs the dispatch model, by
+// design: a worker that traps inside handle_request dies with
+// its request handle unreleased -- the connection stays out of
+// the pool until process exit. The intensity policy bounds
+// the leak (at most TRAP_LIMIT+1 stranded connections before
+// the process fails loudly and the OS reclaims every fd), and
+// the supervisor still writes the trapped request's access-log
+// line from the worker's outcome slot (synthetic 500 when no
+// status was set), so log lines stay equal to served requests.
+// The watchdog semantics migrate as progress supervision: each
+// worker stamps the start of its in-flight request; a request
+// older than the reap bound (TRAP_REAP_MAX_S, or
+// TRAP_REAP_AFTER_S when every worker is busy) is declared a
+// process-level fault and fails loudly (exit 4) -- the
+// supervisor cannot join a wedged worker without stalling
+// itself, so the process exit IS the reap.
+// ----------------------------------------------------------------
+
+const WORKER_ACCEPT_MS: u32 = 50;
+const WORKER_REQ_BUDGET: u64 = 20000;
+const MAX_WORKERS: u64 = 64;
+
+struct WorkerState {
+    idx: u64,
+    active: bool,
+    handle: u64,
+    incarnation: u64,
+    inc_served: u64,
+    in_flight: bool,
+    started: u64,
+    req: ptr,
+    trapped: bool,
+    trap_code: i32,
+    outcome: Outcome,
+}
+
+fn worker_state_new(idx: u64) -> *WorkerState {
+    return Box::into_raw(Box::new(WorkerState {
+        idx: idx, active: false, handle: 0, incarnation: 0,
+        inc_served: 0, in_flight: false, started: 0, req: PTR_NULL(),
+        trapped: false, trap_code: 0,
+        outcome: Outcome {
+            status: 0, body_bytes: 0,
+            method: [0u8; 16], method_len: 0,
+            path: [0u8; 1024], path_len: 0,
+            ua: [0u8; 256], ua_len: 0,
+            remote: [0u8; 64], remote_len: 0,
+        },
+    }));
+}
+
+struct WorkerJob {
+    ctx: *ServerCtx,
+    ws: *WorkerState,
+}
+
+struct MonitorJob {
+    ctx: *ServerCtx,
+    ws: *WorkerState,
+    handle: u64,
+}
+
+// The merged-model worker: accept and serve on the shared
+// handle until the incarnation's request budget is spent,
+// then return (the monitor reports the exit and the
+// supervisor respawns a fresh incarnation). The outcome slot
+// lives in the worker's WorkerState, so a trapped worker's
+// last request stays inspectable by the supervisor. The
+// in-flight stamp is cleared only after the log line is
+// appended, so a trap anywhere between accept and the
+// completed append still leaves a loggable in-flight request
+// with a final outcome.
+fn merged_worker(job: *WorkerJob) {
+    let ctx: *ServerCtx = (*job).ctx;
+    let ws: *WorkerState = (*job).ws;
+    let served: u64 = 0;
+    (*ws).inc_served = 0;
+    while served < WORKER_REQ_BUDGET {
+        let req: ptr = PTR_NULL();
+        let ast: u32 = sa_http_server_accept_v2((*ctx).srv, WORKER_ACCEPT_MS, &req);
+        if ast == 0 {
+            (*ws).req = req;
+            (*ws).started = dict_now();
+            (*ws).in_flight = true;
+            handle_request(req, &(*ctx).settings, &(*ctx).proxy, &(*ctx).zones, &(*ws).outcome);
+            sa_http_server_req_free_v2(req);
+            (*ws).req = PTR_NULL();
+            sa_sync_mutex_lock((*ctx).log_mutex);
+            access_log_append(&(*ctx).sink,
+                              PTR_BYTE_ADD(&(*ws).outcome.remote, 0), (*ws).outcome.remote_len,
+                              PTR_BYTE_ADD(&(*ws).outcome.method, 0), (*ws).outcome.method_len,
+                              PTR_BYTE_ADD(&(*ws).outcome.path, 0), (*ws).outcome.path_len,
+                              (*ws).outcome.status, (*ws).outcome.body_bytes,
+                              PTR_BYTE_ADD(&(*ws).outcome.ua, 0), (*ws).outcome.ua_len);
+            sa_sync_mutex_unlock((*ctx).log_mutex);
+            (*ws).in_flight = false;
+            (*ws).started = 0;
+            served = served + 1;
+            (*ws).inc_served = served;
+        } else {
+            // Slice expired (or the face reported an error):
+            // a 1 ms nap bounds any error spin; the event
+            // path never pays it.
+            sa_task_sleep_ms(1);
+        };
+    }
+    let reclaimed = unsafe { Box::from_raw(job) };
+}
+
+// Per-incarnation monitor: join one worker incarnation and
+// report the outcome on the results channel. Payload packs
+// the worker idx in the high 32 bits; the low 32 bits are the
+// served count for a normal exit, or 2^31 + |trap code| for a
+// trapped exit.
+fn worker_monitor(job: *MonitorJob) {
+    let ctx: *ServerCtx = (*job).ctx;
+    let ws: *WorkerState = (*job).ws;
+    let h: u64 = (*job).handle;
+    let st = sa_task_join(h);
+    let low: u64 = (*ws).inc_served;
+    if st == 100 {
+        low = 2147483648;
+        let code: i32 = 0;
+        let msg_ptr: ptr = PTR_NULL();
+        let msg_len: u64 = 0;
+        if sa_task_trap_info(h, &code, &msg_ptr, &msg_len) == 0 {
+            let c: i32 = code;
+            if c < 0 {
+                c = 0 - c;
+            };
+            low = 2147483648 + (c as u64);
+        };
+    };
+    (*ctx).results.send((*ws).idx * 4294967296 + low);
+    let reclaimed = unsafe { Box::from_raw(job) };
+}
+
+// Spawn one worker incarnation plus its monitor. The
+// supervisor is the only caller, so incarnation bookkeeping
+// has a single writer.
+fn spawn_worker(ctx: *ServerCtx, idx: u64) {
+    let ws: *WorkerState = (*ctx).workers[idx];
+    (*ws).inc_served = 0;
+    (*ws).in_flight = false;
+    (*ws).started = 0;
+    (*ws).req = PTR_NULL();
+    (*ws).trapped = false;
+    (*ws).trap_code = 0;
+    (*ws).incarnation = (*ws).incarnation + 1;
+    (*ws).active = true;
+    let job = Box::into_raw(Box::new(WorkerJob { ctx: ctx, ws: ws }));
+    let h = go supervised merged_worker(job);
+    (*ws).handle = h;
+    let mjob = Box::into_raw(Box::new(MonitorJob { ctx: ctx, ws: ws, handle: h }));
+    let mh = go worker_monitor(mjob);
+}
+
+// Process one incarnation exit report: account traps against
+// the intensity policy (same window semantics as
+// recycle_completion), write the trapped request's log line if
+// one was in flight, and respawn the worker. Returns 3 when
+// the trap intensity limit is breached.
+fn handle_exit_report(ctx: *ServerCtx, payload: u64, traps: &TrapState) -> i32 {
+    let idx: u64 = payload / 4294967296;
+    let low: u64 = payload % 4294967296;
+    let ws: *WorkerState = (*ctx).workers[idx];
+    (*ws).active = false;
+    (*ws).handle = 0;
+    if low >= 2147483648 {
+        (*ws).trapped = true;
+        (*ws).trap_code = (low - 2147483648) as i32;
+        if (*ws).in_flight {
+            let status: u32 = (*ws).outcome.status;
+            if status == 0 {
+                status = 500;
+            };
+            sa_sync_mutex_lock((*ctx).log_mutex);
+            access_log_append(&(*ctx).sink,
+                              PTR_BYTE_ADD(&(*ws).outcome.remote, 0), (*ws).outcome.remote_len,
+                              PTR_BYTE_ADD(&(*ws).outcome.method, 0), (*ws).outcome.method_len,
+                              PTR_BYTE_ADD(&(*ws).outcome.path, 0), (*ws).outcome.path_len,
+                              status, (*ws).outcome.body_bytes,
+                              PTR_BYTE_ADD(&(*ws).outcome.ua, 0), (*ws).outcome.ua_len);
+            sa_sync_mutex_unlock((*ctx).log_mutex);
+            (*ws).in_flight = false;
+            (*ws).started = 0;
+            // The trapped request's handle is deliberately NOT
+            // released: it belongs to a dead task's half-served
+            // connection and stays out of the pool until the
+            // process exits (bounded by the intensity policy).
+            (*ws).req = PTR_NULL();
+        };
+        let now: u64 = dict_now();
+        if now >= traps.window_start + TRAP_WINDOW_S {
+            traps.window_start = now;
+            traps.count = 0;
+        };
+        traps.count = traps.count + 1;
+        if (*ctx).debug_sup {
+            println("slanginx: worker incarnation trapped; respawning");
+        };
+        if traps.count > TRAP_LIMIT {
+            return 3;
+        };
+    } else {
+        if (*ctx).debug_sup {
+            println("slanginx: worker incarnation completed its budget; respawning");
+        };
+    };
+    spawn_worker(ctx, idx);
+    return 0;
+}
+
+// Merged-model watchdog: a worker whose in-flight request is
+// older than the reap bound is wedged (or on a transfer slower
+// than the bound tolerates). The supervisor declares a
+// process-level fault (exit 4): joining a wedged worker would
+// stall the supervisor itself, so the process exit is the
+// reap. Bounds mirror the dispatch watchdog: the aggressive
+// bound applies when every worker is busy (no capacity is
+// being served anyway), the routine bound otherwise.
+fn merged_watchdog_scan(ctx: *ServerCtx) -> i32 {
+    let now: u64 = dict_now();
+    let all_busy: bool = true;
+    let i: u64 = 0;
+    while i < (*ctx).worker_count {
+        let ws: *WorkerState = (*ctx).workers[i];
+        if (*ws).active {
+            if !(*ws).in_flight {
+                all_busy = false;
+            };
+        };
+        i = i + 1;
+    }
+    let age_limit: u64 = TRAP_REAP_MAX_S;
+    if all_busy {
+        age_limit = TRAP_REAP_AFTER_S;
+    };
+    let j: u64 = 0;
+    while j < (*ctx).worker_count {
+        let ws2: *WorkerState = (*ctx).workers[j];
+        if (*ws2).active {
+            if (*ws2).in_flight {
+                if now >= (*ws2).started + age_limit {
+                    println("slanginx: worker request in flight beyond the reap bound; failing loudly");
+                    return 4;
+                };
+            };
+        };
+        j = j + 1;
+    }
+    return 0;
+}
+
+struct ExitBox {
+    payload: u64,
+    kind: u64,
+    closed: bool,
+}
+
+// Blocking exit-report wait in 1 s slices: kind 1 = a report
+// arrived, kind 3 = the slice timed out (the caller runs the
+// watchdog scan). The merged supervisor's waits use ONLY the
+// select shapes, like the dispatcher's (no Chan::len()).
+fn select_exit(ctx: *ServerCtx, out: &ExitBox) {
+    out.payload = 0;
+    out.kind = 0;
+    out.closed = false;
+    select {
+        case let (v, closed) = (*ctx).results.recv() {
+            out.kind = 1;
+            out.payload = v;
+            out.closed = closed;
+        }
+        timeout(1000000000) {
+            out.kind = 3;
+        }
+    }
+}
+
+// One supervisor generation: spawn any missing workers, then
+// consume up to GEN_EVENT_BUDGET exit reports (watchdog scans
+// run on the 1 s timeout slices), and return 0 so serve_merged
+// starts the next generation on a fresh frame. Trap accounting
+// state lives in the caller's TrapState and persists across
+// generations (strictly stronger than the dispatch model,
+// whose accounting resets per generation).
+fn serve_merged_generation(ctx: *ServerCtx, traps: &TrapState) -> i32 {
+    let i: u64 = 0;
+    while i < (*ctx).worker_count {
+        let ws: *WorkerState = (*ctx).workers[i];
+        if !(*ws).active {
+            spawn_worker(ctx, i);
+        };
+        i = i + 1;
+    }
+    let events: u64 = 0;
+    while events < GEN_EVENT_BUDGET {
+        let eb = ExitBox { payload: 0, kind: 0, closed: false };
+        select_exit(ctx, &eb);
+        if eb.closed {
+            return 3;
+        };
+        if eb.kind == 1 {
+            let rc = handle_exit_report(ctx, eb.payload, traps);
+            if rc != 0 {
+                return rc;
+            };
+            events = events + 1;
+        } else {
+            let rcw = merged_watchdog_scan(ctx);
+            if rcw != 0 {
+                return rcw;
+            };
+        };
+    }
+    return 0;
+}
+
+// Merged-model supervisor: generations back to back on fresh
+// frames, forever. A generation result of 3 is the trap
+// intensity breach (loud failure, same message as the dispatch
+// model); 4 is the watchdog's process-level fault (its own
+// message was already printed by the scan).
+fn serve_merged(ctx: *ServerCtx) -> i32 {
+    let traps = TrapState { count: 0, window_start: dict_now() };
+    while true {
+        let rc = serve_merged_generation(ctx, &traps);
+        if rc == 3 {
+            println("slanginx: trap intensity limit exceeded; failing loudly");
+            return rc;
+        };
+        if rc != 0 {
+            return rc;
+        };
+    }
+    return 0;
+}
+
 fn main() -> i32 {
     // --- locate the TOML config: $SLANGINX_CONFIG or ./slanginx.toml ---
     let from_env = env_config_path();
@@ -1136,17 +1520,42 @@ fn main() -> i32 {
         return 3;
     };
     pc.cursor_mutex = mh;
+    // Merged-model boot state: the access-log mutex (workers
+    // append their own lines under it), the incarnation-exit
+    // results channel, and the serve-model selection read from
+    // the settings the operator declared.
+    let lmh: u64 = 0;
+    if sa_sync_mutex_new(&lmh) != 0 {
+        println("slanginx: log mutex create failed");
+        return 3;
+    };
+    let use_merged: bool = bytes_eq_lit(PTR_BYTE_ADD(&s.serve_model, 0), s.serve_model_len, STR_PTR("merged"), STR_LEN("merged"));
+    let worker_count_v: u64 = s.workers;
+    let debug_sup: bool = sa_env_has(STR_PTR("SLANGINX_DEBUG_SUPERVISOR"), STR_LEN("SLANGINX_DEBUG_SUPERVISOR")) == 0;
     let completions: Chan<u64> = Chan::new(64);
+    let results: Chan<u64> = Chan::new(64);
     let slot0 = conn_slot_new(0);
+    let wstate0 = worker_state_new(0);
     let ctx = Box::into_raw(Box::new(ServerCtx {
         settings: s, proxy: pc, zones: dz, sink: sink, srv: srv,
         completions: completions,
         slots: [slot0; 64],
+        results: results,
+        workers: [wstate0; 64],
+        log_mutex: lmh,
+        worker_count: worker_count_v,
+        merged: use_merged,
+        debug_sup: debug_sup,
     }));
     let si: u64 = 1;
     while si < CONN_SLOTS {
         (*ctx).slots[si] = conn_slot_new(si);
+        (*ctx).workers[si] = worker_state_new(si);
         si = si + 1;
     }
+    if use_merged {
+        println("slanginx: serve model merged (workers accept directly)");
+        return serve_merged(ctx);
+    };
     return serve(ctx);
 }
