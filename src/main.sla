@@ -633,7 +633,6 @@ struct ServerCtx {
     // merged is true; the dispatch model never touches them).
     results: Chan<u64>,
     workers: [*WorkerState; 64],
-    log_mutex: u64,
     worker_count: u64,
     merged: bool,
     debug_sup: bool,
@@ -1135,7 +1134,22 @@ struct WorkerState {
     req: ptr,
     trapped: bool,
     trap_code: i32,
-    outcome: Outcome,
+    // (b1-beta) double-buffered outcome slots: the worker
+    // serves request seq into slot seq%2 and reports it on the
+    // results channel; the supervisor appends the line from the
+    // slot and advances log_done. log_seq/log_done live across
+    // incarnations so a late record can never be overwritten
+    // early. trap_line_pending marks a trapped in-flight
+    // request whose line the supervisor appends itself once
+    // earlier records have drained (log_done reaches log_seq).
+    outcome_a: Outcome,
+    outcome_b: Outcome,
+    cur_slot: u64,
+    log_seq: u64,
+    log_done: u64,
+    trap_line_pending: bool,
+    trap_seq: u64,
+    trap_slot: u64,
 }
 
 fn worker_state_new(idx: u64) -> *WorkerState {
@@ -1143,13 +1157,22 @@ fn worker_state_new(idx: u64) -> *WorkerState {
         idx: idx, active: false, handle: 0, incarnation: 0,
         inc_served: 0, in_flight: false, started: 0, req: PTR_NULL(),
         trapped: false, trap_code: 0,
-        outcome: Outcome {
+        outcome_a: Outcome {
             status: 0, body_bytes: 0,
             method: [0u8; 16], method_len: 0,
             path: [0u8; 1024], path_len: 0,
             ua: [0u8; 256], ua_len: 0,
             remote: [0u8; 64], remote_len: 0,
         },
+        outcome_b: Outcome {
+            status: 0, body_bytes: 0,
+            method: [0u8; 16], method_len: 0,
+            path: [0u8; 1024], path_len: 0,
+            ua: [0u8; 256], ua_len: 0,
+            remote: [0u8; 64], remote_len: 0,
+        },
+        cur_slot: 0, log_seq: 0, log_done: 0,
+        trap_line_pending: false, trap_seq: 0, trap_slot: 0,
     }));
 }
 
@@ -1167,13 +1190,13 @@ struct MonitorJob {
 // The merged-model worker: accept and serve on the shared
 // handle until the incarnation's request budget is spent,
 // then return (the monitor reports the exit and the
-// supervisor respawns a fresh incarnation). The outcome slot
-// lives in the worker's WorkerState, so a trapped worker's
-// last request stays inspectable by the supervisor. The
-// in-flight stamp is cleared only after the log line is
-// appended, so a trap anywhere between accept and the
-// completed append still leaves a loggable in-flight request
-// with a final outcome.
+// supervisor respawns a fresh incarnation). (b1-beta) lean
+// supervision logging: the worker serves into its
+// double-buffered outcome slot and reports the completion on
+// the results channel; the supervisor is the only access-log
+// writer. A trap anywhere between accept and the completion
+// report still leaves a loggable in-flight request whose
+// outcome the supervisor reads from the current slot.
 fn merged_worker(job: *WorkerJob) {
     let ctx: *ServerCtx = (*job).ctx;
     let ws: *WorkerState = (*job).ws;
@@ -1183,22 +1206,37 @@ fn merged_worker(job: *WorkerJob) {
         let req: ptr = PTR_NULL();
         let ast: u32 = sa_http_server_accept_v2((*ctx).srv, WORKER_ACCEPT_MS, &req);
         if ast == 0 {
+            // Slot discipline: before reusing slot seq%2, the
+            // record for seq-2 must have been appended
+            // (log_done is written only by the supervisor; a
+            // stale read can only lengthen this wait, never
+            // corrupt a line).
+            let seq: u64 = (*ws).log_seq;
+            if seq >= 2 {
+                while (*ws).log_done < seq - 1 {
+                    sa_task_sleep_ms(1);
+                }
+            };
+            let slot: u64 = seq % 2;
+            (*ws).cur_slot = slot;
             (*ws).req = req;
             (*ws).started = dict_now();
             (*ws).in_flight = true;
-            handle_request(req, &(*ctx).settings, &(*ctx).proxy, &(*ctx).zones, &(*ws).outcome);
+            if slot == 0 {
+                handle_request(req, &(*ctx).settings, &(*ctx).proxy, &(*ctx).zones, &(*ws).outcome_a);
+            } else {
+                handle_request(req, &(*ctx).settings, &(*ctx).proxy, &(*ctx).zones, &(*ws).outcome_b);
+            };
             sa_http_server_req_free_v2(req);
             (*ws).req = PTR_NULL();
-            sa_sync_mutex_lock((*ctx).log_mutex);
-            access_log_append(&(*ctx).sink,
-                              PTR_BYTE_ADD(&(*ws).outcome.remote, 0), (*ws).outcome.remote_len,
-                              PTR_BYTE_ADD(&(*ws).outcome.method, 0), (*ws).outcome.method_len,
-                              PTR_BYTE_ADD(&(*ws).outcome.path, 0), (*ws).outcome.path_len,
-                              (*ws).outcome.status, (*ws).outcome.body_bytes,
-                              PTR_BYTE_ADD(&(*ws).outcome.ua, 0), (*ws).outcome.ua_len);
-            sa_sync_mutex_unlock((*ctx).log_mutex);
             (*ws).in_flight = false;
             (*ws).started = 0;
+            // Completion record on the results channel: kind
+            // bit 2^62, worker idx in bits 40..45, request seq
+            // in the low 40 bits (exit payloads stay below
+            // 2^38, so the kinds never collide).
+            (*ctx).results.send(4611686018427387904 + (*ws).idx * 1099511627776 + seq);
+            (*ws).log_seq = seq + 1;
             served = served + 1;
             (*ws).inc_served = served;
         } else {
@@ -1259,6 +1297,62 @@ fn spawn_worker(ctx: *ServerCtx, idx: u64) {
     let mh = go worker_monitor(mjob);
 }
 
+// Append one access-log line from a worker outcome slot.
+// The supervisor is the only caller (single writer, no mutex).
+fn append_outcome_line(ctx: *ServerCtx, o: &Outcome, status: u32) {
+    access_log_append(&(*ctx).sink,
+                      PTR_BYTE_ADD(&o.remote, 0), o.remote_len,
+                      PTR_BYTE_ADD(&o.method, 0), o.method_len,
+                      PTR_BYTE_ADD(&o.path, 0), o.path_len,
+                      status, o.body_bytes,
+                      PTR_BYTE_ADD(&o.ua, 0), o.ua_len);
+}
+
+// Consume one (b1-beta) completion record: append the line
+// for (idx, seq) from its outcome slot and advance log_done.
+// Records from one worker arrive in send order; a record whose
+// seq is not the expected next one is out of discipline and is
+// dropped (the wait in merged_worker makes it unreachable).
+// Afterwards, a pending trapped line for this worker whose
+// turn has come is appended from the current slot.
+fn handle_log_record(ctx: *ServerCtx, payload: u64) {
+    let idx: u64 = (payload / 1099511627776) % 64;
+    let seq: u64 = payload % 1099511627776;
+    let ws: *WorkerState = (*ctx).workers[idx];
+    // A trapped line owed by the supervisor is appended as
+    // soon as every earlier record has drained; its slot
+    // content is still intact because the next incarnation
+    // cannot reuse that slot before log_done passes trap_seq.
+    if (*ws).trap_line_pending {
+        if (*ws).log_done == (*ws).trap_seq {
+            if (*ws).trap_slot == 0 {
+                let status: u32 = (*ws).outcome_a.status;
+                if status == 0 {
+                    status = 500;
+                };
+                append_outcome_line(ctx, &(*ws).outcome_a, status);
+            } else {
+                let status: u32 = (*ws).outcome_b.status;
+                if status == 0 {
+                    status = 500;
+                };
+                append_outcome_line(ctx, &(*ws).outcome_b, status);
+            };
+            (*ws).log_done = (*ws).trap_seq + 1;
+            (*ws).trap_line_pending = false;
+        };
+    };
+    if seq != (*ws).log_done {
+        return;
+    };
+    if seq % 2 == 0 {
+        append_outcome_line(ctx, &(*ws).outcome_a, (*ws).outcome_a.status);
+    } else {
+        append_outcome_line(ctx, &(*ws).outcome_b, (*ws).outcome_b.status);
+    };
+    (*ws).log_done = seq + 1;
+}
+
 // Process one incarnation exit report: account traps against
 // the intensity policy (same window semantics as
 // recycle_completion), write the trapped request's log line if
@@ -1274,18 +1368,36 @@ fn handle_exit_report(ctx: *ServerCtx, payload: u64, traps: &TrapState) -> i32 {
         (*ws).trapped = true;
         (*ws).trap_code = (low - 2147483648) as i32;
         if (*ws).in_flight {
-            let status: u32 = (*ws).outcome.status;
-            if status == 0 {
-                status = 500;
+            // The trapped request's line is owed by the
+            // supervisor itself. The worker is dead, so the
+            // sequence can be advanced here: the line is
+            // appended now if earlier records have drained
+            // (log_done == log_seq), else it stays pending
+            // until handle_log_record catches up (the slot is
+            // not reused before then: the next incarnation's
+            // wait keys on log_done). The trapped request
+            // handle is deliberately NOT released (see below).
+            if (*ws).log_done == (*ws).log_seq {
+                if (*ws).cur_slot == 0 {
+                    let status: u32 = (*ws).outcome_a.status;
+                    if status == 0 {
+                        status = 500;
+                    };
+                    append_outcome_line(ctx, &(*ws).outcome_a, status);
+                } else {
+                    let status: u32 = (*ws).outcome_b.status;
+                    if status == 0 {
+                        status = 500;
+                    };
+                    append_outcome_line(ctx, &(*ws).outcome_b, status);
+                };
+                (*ws).log_done = (*ws).log_seq + 1;
+            } else {
+                (*ws).trap_line_pending = true;
+                (*ws).trap_seq = (*ws).log_seq;
+                (*ws).trap_slot = (*ws).cur_slot;
             };
-            sa_sync_mutex_lock((*ctx).log_mutex);
-            access_log_append(&(*ctx).sink,
-                              PTR_BYTE_ADD(&(*ws).outcome.remote, 0), (*ws).outcome.remote_len,
-                              PTR_BYTE_ADD(&(*ws).outcome.method, 0), (*ws).outcome.method_len,
-                              PTR_BYTE_ADD(&(*ws).outcome.path, 0), (*ws).outcome.path_len,
-                              status, (*ws).outcome.body_bytes,
-                              PTR_BYTE_ADD(&(*ws).outcome.ua, 0), (*ws).outcome.ua_len);
-            sa_sync_mutex_unlock((*ctx).log_mutex);
+            (*ws).log_seq = (*ws).log_seq + 1;
             (*ws).in_flight = false;
             (*ws).started = 0;
             // The trapped request's handle is deliberately NOT
@@ -1406,11 +1518,15 @@ fn serve_merged_generation(ctx: *ServerCtx, traps: &TrapState) -> i32 {
             return 3;
         };
         if eb.kind == 1 {
-            let rc = handle_exit_report(ctx, eb.payload, traps);
-            if rc != 0 {
-                return rc;
+            if eb.payload >= 4611686018427387904 {
+                handle_log_record(ctx, eb.payload);
+            } else {
+                let rc = handle_exit_report(ctx, eb.payload, traps);
+                if rc != 0 {
+                    return rc;
+                };
+                events = events + 1;
             };
-            events = events + 1;
         } else {
             let rcw = merged_watchdog_scan(ctx);
             if rcw != 0 {
@@ -1520,15 +1636,10 @@ fn main() -> i32 {
         return 3;
     };
     pc.cursor_mutex = mh;
-    // Merged-model boot state: the access-log mutex (workers
-    // append their own lines under it), the incarnation-exit
-    // results channel, and the serve-model selection read from
-    // the settings the operator declared.
-    let lmh: u64 = 0;
-    if sa_sync_mutex_new(&lmh) != 0 {
-        println("slanginx: log mutex create failed");
-        return 3;
-    };
+    // Merged-model boot state: the results channel (worker
+    // completion records + incarnation-exit reports), and the
+    // serve-model selection read from the settings the
+    // operator declared.
     let use_merged: bool = bytes_eq_lit(PTR_BYTE_ADD(&s.serve_model, 0), s.serve_model_len, STR_PTR("merged"), STR_LEN("merged"));
     let worker_count_v: u64 = s.workers;
     let debug_sup: bool = sa_env_has(STR_PTR("SLANGINX_DEBUG_SUPERVISOR"), STR_LEN("SLANGINX_DEBUG_SUPERVISOR")) == 0;
@@ -1542,7 +1653,6 @@ fn main() -> i32 {
         slots: [slot0; 64],
         results: results,
         workers: [wstate0; 64],
-        log_mutex: lmh,
         worker_count: worker_count_v,
         merged: use_merged,
         debug_sup: debug_sup,
