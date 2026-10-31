@@ -563,6 +563,22 @@ fn env_config_path() -> ConfigPath {
 // c1 780 rps / p99 1.7 ms at 1 ms vs 186 rps / p99 5.6 ms at
 // 5 ms, c10 throughput unchanged (~5.6k rps both).
 //
+// 2026-10-31 root-cause correction: the quantization was not
+// the face's poll -- it was this dispatcher's release order.
+// A keep-alive connection re-enters the face's pool only when
+// its request handle is released, and the release used to run
+// in recycle_completion, i.e. only after the parked accept
+// returned and the completion was drained; the parked accept
+// therefore could not see the queued next request until the
+// slice expired. The worker now releases its own handle
+// before sending its completion (see conn_worker), so the
+// pooled fd wakes the dispatcher's poll directly. The slice
+// still bounds the fresh-connection head-parse budget inside
+// sa_http_server_accept_v2 (its timeout is shared between the
+// readiness poll and the bounded accept), which is why it
+// stays small: at 1 ms a fresh connection whose headers miss
+// the budget window under load is closed unanswered.
+//
 // Generational rotation bounds the loop stack ratchet (a
 // codegen-level defect tracked separately: loop-body
 // stack_alloc does not rewind per iteration, ~13-16
@@ -631,6 +647,14 @@ struct ConnSlot {
     busy: bool,
     started: u64,
     seq: u64,
+    // True when the worker itself released the request handle
+    // (sa_http_server_req_free_v2) before sending its
+    // completion; the dispatcher then skips its own release in
+    // recycle_completion. Stays false for trapped workers (the
+    // dispatcher releases after joining them) and for workers
+    // the watchdog reaped mid-flight (their seq check fails,
+    // so they skip the release and the dispatcher does it).
+    req_released: bool,
 }
 
 struct ConnJob {
@@ -650,20 +674,44 @@ fn conn_slot_new(idx: u64) -> *ConnSlot {
         },
         trapped: false, trap_code: 0,
         handle: 0, busy: false, started: 0, seq: 0,
+        req_released: false,
     }));
 }
 
 // The per-connection worker: run handle_request for exactly
-// one request, report the slot on the completions channel
-// (payload packs the slot idx and its dispatch sequence), and
-// reclaim the job box. If the worker traps, the completion is
-// never sent -- the dispatcher's watchdog reaps the slot by
-// joining this task's handle (see watchdog_scan).
+// one request, release the request handle itself, report the
+// slot on the completions channel (payload packs the slot idx
+// and its dispatch sequence), and reclaim the job box. If the
+// worker traps, the completion is never sent -- the
+// dispatcher's watchdog reaps the slot by joining this task's
+// handle (see watchdog_scan).
+//
+// The worker-side release is a latency fix (2026-10-31): the
+// release is what returns a keep-alive connection to the std
+// face's pool. When only the dispatcher released (after
+// draining the completion), a parked accept_v2 call could not
+// see the connection -- and the next request already queued
+// on it -- until the poll slice expired, so every keep-alive
+// request after the first paid a full ACCEPT_POLL_MS of dead
+// latency (measured: c1 mean 38 ms at a 50 ms slice, ~= the
+// slice at 1 ms). Releasing in the worker puts the connection
+// back in the pool while the dispatcher is still parked, so
+// its poll wakes on the pooled fd the moment the next request
+// lands. The seq check keeps this safe against the watchdog:
+// a slot reaped mid-flight has a bumped seq, so its worker
+// skips the release and the dispatcher's recycle_completion
+// (which joins the task before deciding) releases instead --
+// exactly one release per request in every interleaving.
 fn conn_worker(job: *ConnJob) {
     let ctx: *ServerCtx = (*job).ctx;
     let slot: *ConnSlot = (*job).slot;
-    let payload: u64 = (*slot).idx * 4294967296 + ((*slot).seq % 4294967296);
+    let my_seq: u64 = (*slot).seq;
+    let payload: u64 = (*slot).idx * 4294967296 + (my_seq % 4294967296);
     handle_request((*slot).req, &(*ctx).settings, &(*ctx).proxy, &(*ctx).zones, &(*slot).outcome);
+    if (*slot).seq == my_seq {
+        sa_http_server_req_free_v2((*slot).req);
+        (*slot).req_released = true;
+    };
     (*ctx).completions.send(payload);
     let reclaimed = unsafe { Box::from_raw(job) };
 }
@@ -725,7 +773,15 @@ fn recycle_completion(ctx: *ServerCtx, idx: u64, traps: &TrapState) -> i32 {
                       PTR_BYTE_ADD(&(*slot).outcome.path, 0), (*slot).outcome.path_len,
                       status, (*slot).outcome.body_bytes,
                       PTR_BYTE_ADD(&(*slot).outcome.ua, 0), (*slot).outcome.ua_len);
-    sa_http_server_req_free_v2((*slot).req);
+    // The worker normally released the handle itself before
+    // sending its completion (see conn_worker); release here
+    // only when it did not (trapped worker, or a worker the
+    // watchdog reaped mid-flight whose seq check skipped its
+    // release). join_slot_task above has already waited for
+    // the worker to exit, so this cannot double-release.
+    if !(*slot).req_released {
+        sa_http_server_req_free_v2((*slot).req);
+    };
     (*slot).req = PTR_NULL();
     if (*slot).trapped {
         if traps.count > TRAP_LIMIT {
@@ -866,6 +922,7 @@ fn select_completion(ctx: *ServerCtx, out: &SelectBox) {
 fn start_request(ctx: *ServerCtx, slot_idx: u64, req: ptr) {
     let slot: *ConnSlot = (*ctx).slots[slot_idx];
     (*slot).req = req;
+    (*slot).req_released = false;
     (*slot).trapped = false;
     (*slot).trap_code = 0;
     (*slot).seq = (*slot).seq + 1;
