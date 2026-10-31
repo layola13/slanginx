@@ -15,10 +15,10 @@ max_file_bytes = 33554432
 # hands each request to a per-request goroutine; "merged" =
 # a fixed set of long-lived workers accepts and serves directly
 # (no per-request spawn). workers = the merged model's worker
-# count (1..64, default 4); pair it with SA_TASK_CARRIERS >=
-# workers + 4 in the launch environment. Defaults: dispatch, 4.
+# count (1..64, default 8); pair it with SA_TASK_CARRIERS >=
+# workers + 4 in the launch environment. Defaults: merged, 8.
 # serve_model = "merged"
-# workers = 4
+# workers = 8
 
 # Shared dict zones (M1, docs/HANDLER_MODEL.md model A): the only
 # cross-request state in the server. Declared here, reached from

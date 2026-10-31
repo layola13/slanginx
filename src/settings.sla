@@ -19,8 +19,8 @@
 //   index = "index.html"        (string)
 //   access_log = "logs/access.log" (string)
 //   max_file_bytes = 33554432   (integer)
-//   workers = 4                 (integer, merged serve model)
-//   serve_model = "dispatch"    (string: "dispatch" | "merged")
+//   workers = 8                 (integer, merged serve model)
+//   serve_model = "merged"      (string: "dispatch" | "merged")
 
 @import "sa_std/encoding/toml.sai"
 @import "sa_std/encoding/toml.sla"
@@ -41,10 +41,11 @@ struct Settings {
     log_path: [u8; 512],
     log_len: u64,
     max_file_bytes: u64,
-    // Round-2 dispatch model (docs in src/main.sla serve section):
-    // serve_model selects the stage-2 dispatcher ("dispatch") or
-    // the merged worker-accepts model ("merged"); workers is the
-    // merged model's worker count (1..64).
+    // Round-2 serve model (docs in src/main.sla serve section):
+    // serve_model selects the merged worker-accepts model
+    // ("merged", the default since the round-2 S4 switch) or the
+    // stage-2 dispatcher ("dispatch"); workers is the merged
+    // model's worker count (1..64, default 8).
     workers: u64,
     serve_model: [u8; 16],
     serve_model_len: u64,
@@ -108,14 +109,14 @@ fn settings_blank() -> Settings {
         index: [0u8; 128], index_len: 0,
         log_path: [0u8; 512], log_len: 0,
         max_file_bytes: 33554432,
-        workers: 4,
+        workers: 8,
         serve_model: [0u8; 16], serve_model_len: 0,
     };
     copy_lit_host(&s, STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1"));
     copy_lit_root(&s, STR_PTR("www"), STR_LEN("www"));
     copy_lit_index(&s, STR_PTR("index.html"), STR_LEN("index.html"));
     copy_lit_log(&s, STR_PTR("logs/access.log"), STR_LEN("logs/access.log"));
-    copy_lit_model(&s, STR_PTR("dispatch"), STR_LEN("dispatch"));
+    copy_lit_model(&s, STR_PTR("merged"), STR_LEN("merged"));
     return s;
 }
 
