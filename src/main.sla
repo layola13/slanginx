@@ -1494,6 +1494,42 @@ fn select_exit(ctx: *ServerCtx, out: &ExitBox) {
     }
 }
 
+// Poll variant (timeout 0): kind 3 means the channel is empty
+// right now. The supervisor drains with this after each
+// blocking wake so one wake pays for the whole pending batch.
+fn select_exit_poll(ctx: *ServerCtx, out: &ExitBox) {
+    out.payload = 0;
+    out.kind = 0;
+    out.closed = false;
+    select {
+        case let (v, closed) = (*ctx).results.recv() {
+            out.kind = 1;
+            out.payload = v;
+            out.closed = closed;
+        }
+        timeout(0) {
+            out.kind = 3;
+        }
+    }
+}
+
+// Handle one results-channel item: a completion record
+// (kind bit 2^62) is appended by handle_log_record; anything
+// else is an incarnation exit report. Returns 0 for a log
+// record, 1 for a handled exit report, or the nonzero
+// supervisor verdict of handle_exit_report.
+fn handle_result_item(ctx: *ServerCtx, payload: u64, traps: &TrapState) -> i32 {
+    if payload >= 4611686018427387904 {
+        handle_log_record(ctx, payload);
+        return 0;
+    };
+    let rc = handle_exit_report(ctx, payload, traps);
+    if rc != 0 {
+        return rc;
+    };
+    return 1;
+}
+
 // One supervisor generation: spawn any missing workers, then
 // consume up to GEN_EVENT_BUDGET exit reports (watchdog scans
 // run on the 1 s timeout slices), and return 0 so serve_merged
@@ -1518,15 +1554,36 @@ fn serve_merged_generation(ctx: *ServerCtx, traps: &TrapState) -> i32 {
             return 3;
         };
         if eb.kind == 1 {
-            if eb.payload >= 4611686018427387904 {
-                handle_log_record(ctx, eb.payload);
+            let rc = handle_result_item(ctx, eb.payload, traps);
+            if rc == 1 {
+                events = events + 1;
             } else {
-                let rc = handle_exit_report(ctx, eb.payload, traps);
                 if rc != 0 {
                     return rc;
                 };
-                events = events + 1;
             };
+            // Drain: poll until the channel is empty so the
+            // wake cost is paid once per batch, not per record.
+            let draining: bool = true;
+            while draining {
+                let db = ExitBox { payload: 0, kind: 0, closed: false };
+                select_exit_poll(ctx, &db);
+                if db.closed {
+                    return 3;
+                };
+                if db.kind == 1 {
+                    let drc = handle_result_item(ctx, db.payload, traps);
+                    if drc == 1 {
+                        events = events + 1;
+                    } else {
+                        if drc != 0 {
+                            return drc;
+                        };
+                    };
+                } else {
+                    draining = false;
+                };
+            }
         } else {
             let rcw = merged_watchdog_scan(ctx);
             if rcw != 0 {
@@ -1644,7 +1701,7 @@ fn main() -> i32 {
     let worker_count_v: u64 = s.workers;
     let debug_sup: bool = sa_env_has(STR_PTR("SLANGINX_DEBUG_SUPERVISOR"), STR_LEN("SLANGINX_DEBUG_SUPERVISOR")) == 0;
     let completions: Chan<u64> = Chan::new(64);
-    let results: Chan<u64> = Chan::new(64);
+    let results: Chan<u64> = Chan::new(1024);
     let slot0 = conn_slot_new(0);
     let wstate0 = worker_state_new(0);
     let ctx = Box::into_raw(Box::new(ServerCtx {
