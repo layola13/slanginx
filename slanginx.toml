@@ -15,8 +15,13 @@ max_file_bytes = 33554432
 # hands each request to a per-request goroutine; "merged" =
 # a fixed set of long-lived workers accepts and serves directly
 # (no per-request spawn). workers = the merged model's worker
-# count (1..64, default 8); pair it with SA_TASK_CARRIERS >=
-# workers + 4 in the launch environment. Defaults: merged, 8.
+# count (1..64, default 8). SA_TASK_CARRIERS is a runtime
+# task-supply knob only: the 2026-11-01 static-tail triage
+# measured carriers 8 -> 12 -> 16 with the static c50 p99
+# (~1 s) unchanged, so carriers >= workers + 4 is NOT a
+# latency remedy and must not be cited as one; the tail lives
+# in the std HTTP face's connection service discipline.
+# Defaults: merged, 8.
 # serve_model = "merged"
 # workers = 8
 

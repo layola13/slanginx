@@ -1219,24 +1219,26 @@ fn merged_worker(job: *WorkerJob) {
     let served: u64 = 0;
     (*ws).inc_served = 0;
     while served < WORKER_REQ_BUDGET {
+        // Slot discipline (D3, tail-fix batch): before reusing
+        // slot seq%4, the record for seq-4 must have been
+        // appended (log_done is written only by the supervisor;
+        // a stale read can only lengthen this wait, never
+        // corrupt a line). The wait now runs BEFORE the accept:
+        // a worker must never hold a claimed, parsed request
+        // hostage while the supervisor drains the log -- while
+        // it waits, the next request stays in the shared pool
+        // where another worker can take it. (Profiling: the
+        // append itself is ~11 us; the post-accept form of this
+        // wait put a 2.5-5 ms slot band on the request path.)
+        let seq: u64 = (*ws).log_seq;
+        if seq >= 4 {
+            while (*ws).log_done < seq - 3 {
+                sa_task_sleep_ms(1);
+            }
+        };
         let req: ptr = PTR_NULL();
         let ast: u32 = sa_http_server_accept_v2((*ctx).srv, WORKER_ACCEPT_MS, &req);
         if ast == 0 {
-            // Slot discipline: before reusing slot seq%4, the
-            // record for seq-4 must have been appended
-            // (log_done is written only by the supervisor; a
-            // stale read can only lengthen this wait, never
-            // corrupt a line). Quad buffering gives the
-            // supervisor three intervening requests of slack,
-            // so in steady state the wait is already satisfied
-            // (profiling: the double-buffer wait was ~half the
-            // worker cycle; the append itself is ~11 us).
-            let seq: u64 = (*ws).log_seq;
-            if seq >= 4 {
-                while (*ws).log_done < seq - 3 {
-                    sa_task_sleep_ms(1);
-                }
-            };
             let slot: u64 = seq % 4;
             (*ws).cur_slot = slot;
             (*ws).req = req;
