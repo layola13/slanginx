@@ -1134,8 +1134,8 @@ struct WorkerState {
     req: ptr,
     trapped: bool,
     trap_code: i32,
-    // (b1-beta) double-buffered outcome slots: the worker
-    // serves request seq into slot seq%2 and reports it on the
+    // (b1-beta) quad-buffered outcome slots: the worker
+    // serves request seq into slot seq%4 and reports it on the
     // results channel; the supervisor appends the line from the
     // slot and advances log_done. log_seq/log_done live across
     // incarnations so a late record can never be overwritten
@@ -1144,6 +1144,8 @@ struct WorkerState {
     // earlier records have drained (log_done reaches log_seq).
     outcome_a: Outcome,
     outcome_b: Outcome,
+    outcome_c: Outcome,
+    outcome_d: Outcome,
     cur_slot: u64,
     log_seq: u64,
     log_done: u64,
@@ -1171,6 +1173,20 @@ fn worker_state_new(idx: u64) -> *WorkerState {
             ua: [0u8; 256], ua_len: 0,
             remote: [0u8; 64], remote_len: 0,
         },
+        outcome_c: Outcome {
+            status: 0, body_bytes: 0,
+            method: [0u8; 16], method_len: 0,
+            path: [0u8; 1024], path_len: 0,
+            ua: [0u8; 256], ua_len: 0,
+            remote: [0u8; 64], remote_len: 0,
+        },
+        outcome_d: Outcome {
+            status: 0, body_bytes: 0,
+            method: [0u8; 16], method_len: 0,
+            path: [0u8; 1024], path_len: 0,
+            ua: [0u8; 256], ua_len: 0,
+            remote: [0u8; 64], remote_len: 0,
+        },
         cur_slot: 0, log_seq: 0, log_done: 0,
         trap_line_pending: false, trap_seq: 0, trap_slot: 0,
     }));
@@ -1192,7 +1208,7 @@ struct MonitorJob {
 // then return (the monitor reports the exit and the
 // supervisor respawns a fresh incarnation). (b1-beta) lean
 // supervision logging: the worker serves into its
-// double-buffered outcome slot and reports the completion on
+// quad-buffered outcome slot and reports the completion on
 // the results channel; the supervisor is the only access-log
 // writer. A trap anywhere between accept and the completion
 // report still leaves a loggable in-flight request whose
@@ -1206,18 +1222,22 @@ fn merged_worker(job: *WorkerJob) {
         let req: ptr = PTR_NULL();
         let ast: u32 = sa_http_server_accept_v2((*ctx).srv, WORKER_ACCEPT_MS, &req);
         if ast == 0 {
-            // Slot discipline: before reusing slot seq%2, the
-            // record for seq-2 must have been appended
+            // Slot discipline: before reusing slot seq%4, the
+            // record for seq-4 must have been appended
             // (log_done is written only by the supervisor; a
             // stale read can only lengthen this wait, never
-            // corrupt a line).
+            // corrupt a line). Quad buffering gives the
+            // supervisor three intervening requests of slack,
+            // so in steady state the wait is already satisfied
+            // (profiling: the double-buffer wait was ~half the
+            // worker cycle; the append itself is ~11 us).
             let seq: u64 = (*ws).log_seq;
-            if seq >= 2 {
-                while (*ws).log_done < seq - 1 {
+            if seq >= 4 {
+                while (*ws).log_done < seq - 3 {
                     sa_task_sleep_ms(1);
                 }
             };
-            let slot: u64 = seq % 2;
+            let slot: u64 = seq % 4;
             (*ws).cur_slot = slot;
             (*ws).req = req;
             (*ws).started = dict_now();
@@ -1225,7 +1245,15 @@ fn merged_worker(job: *WorkerJob) {
             if slot == 0 {
                 handle_request(req, &(*ctx).settings, &(*ctx).proxy, &(*ctx).zones, &(*ws).outcome_a);
             } else {
-                handle_request(req, &(*ctx).settings, &(*ctx).proxy, &(*ctx).zones, &(*ws).outcome_b);
+                if slot == 1 {
+                    handle_request(req, &(*ctx).settings, &(*ctx).proxy, &(*ctx).zones, &(*ws).outcome_b);
+                } else {
+                    if slot == 2 {
+                        handle_request(req, &(*ctx).settings, &(*ctx).proxy, &(*ctx).zones, &(*ws).outcome_c);
+                    } else {
+                        handle_request(req, &(*ctx).settings, &(*ctx).proxy, &(*ctx).zones, &(*ws).outcome_d);
+                    };
+                };
             };
             sa_http_server_req_free_v2(req);
             (*ws).req = PTR_NULL();
@@ -1308,6 +1336,41 @@ fn append_outcome_line(ctx: *ServerCtx, o: &Outcome, status: u32) {
                       PTR_BYTE_ADD(&o.ua, 0), o.ua_len);
 }
 
+// Append the log line for one of a worker's four outcome
+// slots. force500 maps a still-zero status to 500 (a trapped
+// request whose handler died before setting a status).
+fn append_slot_line(ctx: *ServerCtx, ws: *WorkerState, slot: u64, force500: bool) {
+    if slot == 0 {
+        let status: u32 = (*ws).outcome_a.status;
+        if force500 && status == 0 {
+            status = 500;
+        };
+        append_outcome_line(ctx, &(*ws).outcome_a, status);
+    } else {
+        if slot == 1 {
+            let status: u32 = (*ws).outcome_b.status;
+            if force500 && status == 0 {
+                status = 500;
+            };
+            append_outcome_line(ctx, &(*ws).outcome_b, status);
+        } else {
+            if slot == 2 {
+                let status: u32 = (*ws).outcome_c.status;
+                if force500 && status == 0 {
+                    status = 500;
+                };
+                append_outcome_line(ctx, &(*ws).outcome_c, status);
+            } else {
+                let status: u32 = (*ws).outcome_d.status;
+                if force500 && status == 0 {
+                    status = 500;
+                };
+                append_outcome_line(ctx, &(*ws).outcome_d, status);
+            };
+        };
+    };
+}
+
 // Consume one (b1-beta) completion record: append the line
 // for (idx, seq) from its outcome slot and advance log_done.
 // Records from one worker arrive in send order; a record whose
@@ -1325,19 +1388,7 @@ fn handle_log_record(ctx: *ServerCtx, payload: u64) {
     // cannot reuse that slot before log_done passes trap_seq.
     if (*ws).trap_line_pending {
         if (*ws).log_done == (*ws).trap_seq {
-            if (*ws).trap_slot == 0 {
-                let status: u32 = (*ws).outcome_a.status;
-                if status == 0 {
-                    status = 500;
-                };
-                append_outcome_line(ctx, &(*ws).outcome_a, status);
-            } else {
-                let status: u32 = (*ws).outcome_b.status;
-                if status == 0 {
-                    status = 500;
-                };
-                append_outcome_line(ctx, &(*ws).outcome_b, status);
-            };
+            append_slot_line(ctx, ws, (*ws).trap_slot, true);
             (*ws).log_done = (*ws).trap_seq + 1;
             (*ws).trap_line_pending = false;
         };
@@ -1345,11 +1396,7 @@ fn handle_log_record(ctx: *ServerCtx, payload: u64) {
     if seq != (*ws).log_done {
         return;
     };
-    if seq % 2 == 0 {
-        append_outcome_line(ctx, &(*ws).outcome_a, (*ws).outcome_a.status);
-    } else {
-        append_outcome_line(ctx, &(*ws).outcome_b, (*ws).outcome_b.status);
-    };
+    append_slot_line(ctx, ws, seq % 4, false);
     (*ws).log_done = seq + 1;
 }
 
@@ -1378,19 +1425,7 @@ fn handle_exit_report(ctx: *ServerCtx, payload: u64, traps: &TrapState) -> i32 {
             // wait keys on log_done). The trapped request
             // handle is deliberately NOT released (see below).
             if (*ws).log_done == (*ws).log_seq {
-                if (*ws).cur_slot == 0 {
-                    let status: u32 = (*ws).outcome_a.status;
-                    if status == 0 {
-                        status = 500;
-                    };
-                    append_outcome_line(ctx, &(*ws).outcome_a, status);
-                } else {
-                    let status: u32 = (*ws).outcome_b.status;
-                    if status == 0 {
-                        status = 500;
-                    };
-                    append_outcome_line(ctx, &(*ws).outcome_b, status);
-                };
+                append_slot_line(ctx, ws, (*ws).cur_slot, true);
                 (*ws).log_done = (*ws).log_seq + 1;
             } else {
                 (*ws).trap_line_pending = true;
