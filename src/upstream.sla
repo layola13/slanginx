@@ -27,6 +27,8 @@
 @import "sa_std/ptr.sa"
 @import "sa_std/string.sa"
 @import "sa_std/task.sai"
+@import "sa_std/sync/atomic.sa"
+@import "sa_std/sync/atomic.sal"
 
 const PROXY_MAX_POOLS: u64 = 4;
 const PROXY_MAX_SERVERS: u64 = 4;
@@ -39,7 +41,21 @@ struct ProxyConfig {
     pool_names: [u8; 128],
     pool_name_lens: [u64; 4],
     pool_server_counts: [u64; 4],
-    pool_cursors: [u64; 4],
+    // Per-pool round-robin ticket counters (pickfix). One
+    // AtomicUsize per pool, held as scalar fields: an atomic
+    // method call on an ARRAY element receiver currently
+    // addresses the array's base cell whatever the index
+    // (compiler defect; minimal repro in the pickfix probes,
+    // registered in REPORT.md "proxy pick lock removal"),
+    // while a field receiver addresses its own cell.
+    // fetch_add issues tickets in one global order per pool --
+    // the same strict round-robin sequence the boot-installed
+    // cursor mutex used to serialise -- with no lock anywhere
+    // on the pick path. Pools are capped at PROXY_MAX_POOLS.
+    pool_cursor0: AtomicUsize,
+    pool_cursor1: AtomicUsize,
+    pool_cursor2: AtomicUsize,
+    pool_cursor3: AtomicUsize,
     pool_count: u64,
     srv_hosts: [u8; 1024],
     srv_host_lens: [u64; 16],
@@ -48,15 +64,6 @@ struct ProxyConfig {
     route_prefix_lens: [u64; 8],
     route_pools: [u64; 8],
     route_count: u64,
-    // Runtime mutex (sa_sync_mutex handle) guarding pool_cursors
-    // under the per-connection goroutine serve model: workers pick
-    // upstreams concurrently, and the cursor read/advance pair must
-    // stay atomic or two workers can read the same cursor. The
-    // server core creates the mutex at boot and stores the handle
-    // here; 0 means "no mutex" (unit tests, which pick serially,
-    // keep the unguarded pure step). Set once at boot, never
-    // written again -- the field itself is read-only afterwards.
-    cursor_mutex: u64,
 }
 
 struct PathText {
@@ -65,15 +72,23 @@ struct PathText {
 }
 
 fn proxyconf_new() -> ProxyConfig {
+    // The cursor counters are constructed inline in the
+    // literal: binding an AtomicUsize to a named local first
+    // and moving it into the field trips the SAB verifier's
+    // StackEscape (stack allocations cannot move), while the
+    // inline form materialises in place (pickfix probes F24).
     return ProxyConfig {
         pool_names: [0u8; 128], pool_name_lens: [0u64; 4],
-        pool_server_counts: [0u64; 4], pool_cursors: [0u64; 4],
+        pool_server_counts: [0u64; 4],
+        pool_cursor0: AtomicUsize::new(0),
+        pool_cursor1: AtomicUsize::new(0),
+        pool_cursor2: AtomicUsize::new(0),
+        pool_cursor3: AtomicUsize::new(0),
         pool_count: 0,
         srv_hosts: [0u8; 1024], srv_host_lens: [0u64; 16],
         srv_ports: [0u16; 16],
         route_prefixes: [0u8; 1024], route_prefix_lens: [0u64; 8],
         route_pools: [0u64; 8], route_count: 0,
-        cursor_mutex: 0,
     };
 }
 
@@ -402,20 +417,33 @@ fn proxyconf_pick_at(cursor: u64, count: u64) -> u64 {
     return cursor % count;
 }
 
-// Pick the next server slot of a pool, advancing its cursor.
-// When the boot-time cursor mutex is installed, the read/advance
-// pair runs under it (goroutine serve model: concurrent workers
-// must not observe the same cursor); with cursor_mutex == 0 the
-// step is the plain serial one the unit tests pin.
+// Issue the next round-robin ticket of a pool: one fetch_add
+// on the pool's own atomic counter. pool_idx is always
+// < PROXY_MAX_POOLS (parse caps pool_count there, and routes
+// only carry parsed indices).
+fn proxyconf_pool_ticket(pc: &ProxyConfig, pool_idx: u64) -> u64 {
+    if pool_idx == 0 {
+        return pc.pool_cursor0.fetch_add(1, Ordering::SeqCst);
+    };
+    if pool_idx == 1 {
+        return pc.pool_cursor1.fetch_add(1, Ordering::SeqCst);
+    };
+    if pool_idx == 2 {
+        return pc.pool_cursor2.fetch_add(1, Ordering::SeqCst);
+    };
+    return pc.pool_cursor3.fetch_add(1, Ordering::SeqCst);
+}
+
+// Pick the next server slot of a pool. The ticket IS the old
+// mutex-guarded cursor value: fetch_add hands each pick a
+// unique ticket in the counter's global order, so ticket %
+// server_count walks the pool in the same strict round-robin
+// sequence the serialised read/advance pair produced --
+// concurrent workers can neither observe the same cursor nor
+// skew the distribution, and no lock is taken.
 fn proxyconf_pool_pick(pc: &ProxyConfig, pool_idx: u64) -> u64 {
-    if pc.cursor_mutex != 0 {
-        sa_sync_mutex_lock(pc.cursor_mutex);
-    };
     let count: u64 = pc.pool_server_counts[pool_idx];
-    let at: u64 = proxyconf_pick_at(pc.pool_cursors[pool_idx], count);
-    pc.pool_cursors[pool_idx] = pc.pool_cursors[pool_idx] + 1;
-    if pc.cursor_mutex != 0 {
-        sa_sync_mutex_unlock(pc.cursor_mutex);
-    };
+    let ticket: u64 = proxyconf_pool_ticket(pc, pool_idx);
+    let at: u64 = proxyconf_pick_at(ticket, count);
     return pool_idx * PROXY_MAX_SERVERS + at;
 }

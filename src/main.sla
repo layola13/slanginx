@@ -521,8 +521,8 @@ fn env_config_path() -> ConfigPath {
 // back any trap record then. Workers touch only their own
 // slot's Outcome (filled in place), the read-only boot
 // configuration, the globals-backed dict zones (internally
-// serialized by sa_std), and the proxy cursor (mutex-guarded
-// since this batch, see upstream.sla).
+// serialized by sa_std), and the proxy pool cursors (atomic
+// ticket counters, see upstream.sla).
 //
 // Two measured runtime behaviors shape this design:
 //
@@ -1717,17 +1717,13 @@ fn main() -> i32 {
     // The effective listen address is the config's; the
     // acceptance harness verifies it over HTTP.
     println("slanginx: listening (address and root from config)");
-    // --- stage-2 serve model: install the proxy cursor mutex,
-    // build the Box-owned server context (process-lifetime,
-    // deliberately never freed: connection goroutines reach it
-    // by raw pointer), create the slot pool, and hand over to
-    // the dispatcher (see the serve section above). ---
-    let mh: u64 = 0;
-    if sa_sync_mutex_new(&mh) != 0 {
-        println("slanginx: cursor mutex create failed");
-        return 3;
-    };
-    pc.cursor_mutex = mh;
+    // --- stage-2 serve model: build the Box-owned server
+    // context (process-lifetime, deliberately never freed:
+    // connection goroutines reach it by raw pointer), create
+    // the slot pool, and hand over to the dispatcher (see the
+    // serve section above). The proxy pool cursors need no
+    // install step: they are atomic ticket counters zeroed by
+    // proxyconf_new (pickfix, see upstream.sla). ---
     // Merged-model boot state: the results channel (worker
     // completion records + incarnation-exit reports), and the
     // serve-model selection read from the settings the
