@@ -304,7 +304,8 @@ struct AttemptResult {
 fn proxy_attempt(req: ptr, pc: &ProxyConfig, slot: u64,
                  method_code: u8,
                  target: ptr, target_len: u64,
-                 peer: ptr, peer_len: u64, peer_known: bool) -> AttemptResult {
+                 peer: ptr, peer_len: u64, peer_known: bool,
+                 chunk_bp: ptr) -> AttemptResult {
     let ar = AttemptResult { relayed: false, net_status: 6, status: 0, body_bytes: 0 };
     // URL: http://host:port<target>
     let url = TextBuf { bytes: [0u8; 1600], len: 0 };
@@ -383,8 +384,10 @@ fn proxy_attempt(req: ptr, pc: &ProxyConfig, slot: u64,
             let rd: ptr = PTR_NULL();
             let total: u64 = 0;
             if sa_http_client_resp_body_reader(uresp, &rd) == 0 {
-                let chunk: [u8; 4096] = [0u8; 4096];
-                let chunk_ptr: ptr = PTR_BYTE_ADD(&chunk, 0);
+                // Relay staging is the caller's per-slot chunk
+                // scratch (knife1: a per-response [u8; 4096]
+                // local paid a full-size refill per relay).
+                let chunk_ptr: ptr = chunk_bp;
                 let reading: bool = true;
                 while reading {
                     let cl: u64 = 0;
@@ -423,7 +426,7 @@ fn proxy_serve(req: ptr, pc: &ProxyConfig, dz: &DictZones,
                query_ptr: ptr, query_len: u64,
                norm_ptr: ptr, norm_len: u64,
                peer_ptr: ptr, peer_len: u64, peer_known: bool,
-               now: u64) -> ProxyResult {
+               now: u64, tbuf: &TextBuf, chunk_bp: ptr) -> ProxyResult {
     let res = ProxyResult { status: 0, body_bytes: 0 };
     let pool_idx: u64 = pc.route_pools[route_idx as u64];
     let code: u8 = proxy_method_code(method_ptr, method_len);
@@ -439,21 +442,24 @@ fn proxy_serve(req: ptr, pc: &ProxyConfig, dz: &DictZones,
     // NOT stripped (proxy_pass without a URI part).
     // raw_ptr/raw_len (the undecoded path) stay in the signature
     // for the access path's symmetry.
-    let target = TextBuf { bytes: [0u8; 1600], len: 0 };
-    tb_push_byte(&target, 47);
-    tb_push(&target, norm_ptr, norm_len);
+    // The target builder is the caller's per-slot tbuf scratch
+    // (knife1: a per-request TextBuf literal paid a 1600-byte
+    // refill on every proxied request). Only its length resets.
+    tbuf.len = 0;
+    tb_push_byte(tbuf, 47);
+    tb_push(tbuf, norm_ptr, norm_len);
     if query_len > 0 {
-        tb_push_byte(&target, 63);
-        tb_push(&target, query_ptr, query_len);
+        tb_push_byte(tbuf, 63);
+        tb_push(tbuf, query_ptr, query_len);
     };
-    let target_ptr: ptr = PTR_BYTE_ADD(&target.bytes, 0);
+    let target_ptr: ptr = PTR_BYTE_ADD(&tbuf.bytes, 0);
     stats_incr(pc, dz, pool_idx, STR_PTR("requests"), STR_LEN("requests"), now);
     let server_count: u64 = pc.pool_server_counts[pool_idx];
     let last_status: u32 = 6;
     let attempt: u64 = 0;
     while attempt < server_count {
         let slot: u64 = proxyconf_pool_pick(pc, pool_idx);
-        let ar = proxy_attempt(req, pc, slot, code, target_ptr, target.len, peer_ptr, peer_len, peer_known);
+        let ar = proxy_attempt(req, pc, slot, code, target_ptr, tbuf.len, peer_ptr, peer_len, peer_known, chunk_bp);
         if ar.relayed {
             res.status = ar.status;
             res.body_bytes = ar.body_bytes;

@@ -59,6 +59,22 @@ struct Outcome {
     ua_len: u64,
     remote: [u8; 64],
     remote_len: u64,
+    // Per-slot request scratch (knife1, 2026-11-02): the path
+    // resolver output, the filesystem candidate builder, the
+    // proxy target builder and the proxy relay chunk used to be
+    // per-request stack array literals / array-field struct
+    // literals in handle_request and proxy_serve, and on this
+    // toolchain every such literal is re-filled over its full
+    // size on every construction (~4 ns/B: resbuf 1024 + cand
+    // 1400 + tbuf 1600 + chunk 4096 = ~32 us of fill per proxied
+    // request, ~10 us per static request). As Outcome fields
+    // they are filled once per slot; handle_request resets only
+    // the length fields per request. One request at a time runs
+    // per slot, so the scratch is never shared concurrently.
+    resbuf: ResolvedPath,
+    cand: [u8; 1400],
+    tbuf: TextBuf,
+    chunk: [u8; 4096],
 }
 
 // Reset an Outcome in place. The handler fills a caller-owned
@@ -229,11 +245,14 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones, o: &
         };
     };
     // --- path resolution (decode + normalize + containment) ---
-    // Literal local, filled through &ResolvedPath by
-    // webpath_resolve: a by-value resolved_new() return was part
-    // of the stage-2 slope segment 2 (large-struct materialization).
-    let resolved = ResolvedPath { bytes: [0u8; 1024], len: 0, ended_with_slash: false };
-    let rrc: i32 = webpath_resolve(p_ptr, p_len, &resolved);
+    // Filled through &ResolvedPath by webpath_resolve into the
+    // slot's persistent resbuf (knife1: the per-request literal
+    // local paid a 1024-byte refill on every request; a by-value
+    // resolved_new() return was already retired in stage 2 as
+    // large-struct materialization). Only length/flag reset.
+    o.resbuf.len = 0;
+    o.resbuf.ended_with_slash = false;
+    let rrc: i32 = webpath_resolve(p_ptr, p_len, &o.resbuf);
     if rrc == 1 {
         o.status = 403;
         o.body_bytes = send_simple(req, 403, STR_PTR("forbidden\n"), STR_LEN("forbidden\n"));
@@ -244,21 +263,21 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones, o: &
         o.body_bytes = send_simple(req, 400, STR_PTR("bad request\n"), STR_LEN("bad request\n"));
         return;
     };
-    let norm_ptr: ptr = PTR_BYTE_ADD(&resolved.bytes, 0);
+    let norm_ptr: ptr = PTR_BYTE_ADD(&o.resbuf.bytes, 0);
     // --- code-layer deny rule ---
-    if config_path_denied(norm_ptr, resolved.len) {
+    if config_path_denied(norm_ptr, o.resbuf.len) {
         o.status = 403;
         o.body_bytes = send_simple(req, 403, STR_PTR("forbidden\n"), STR_LEN("forbidden\n"));
         return;
     };
     // --- code-layer status route: shared dict readout ---
     if is_get {
-        if bytes_eq_lit(norm_ptr, resolved.len, STR_PTR("__slanginx/status"), STR_LEN("__slanginx/status")) {
-            let body = TextBuf { bytes: [0u8; 1600], len: 0 };
-            if proxy_status_body(pc, dz, &body, dict_now()) == 0 {
-                let body_ptr: ptr = PTR_BYTE_ADD(&body.bytes, 0);
+        if bytes_eq_lit(norm_ptr, o.resbuf.len, STR_PTR("__slanginx/status"), STR_LEN("__slanginx/status")) {
+            o.tbuf.len = 0;
+            if proxy_status_body(pc, dz, &o.tbuf, dict_now()) == 0 {
+                let body_ptr: ptr = PTR_BYTE_ADD(&o.tbuf.bytes, 0);
                 o.status = 200;
-                o.body_bytes = send_simple(req, 200, body_ptr, body.len);
+                o.body_bytes = send_simple(req, 200, body_ptr, o.tbuf.len);
                 return;
             };
             o.status = 404;
@@ -267,15 +286,15 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones, o: &
         };
     };
     // --- reverse-proxy routes (M1) ---
-    let route_idx: i32 = proxyconf_route_match(pc, norm_ptr, resolved.len);
+    let route_idx: i32 = proxyconf_route_match(pc, norm_ptr, o.resbuf.len);
     if route_idx >= 0 {
         let remote_ptr: ptr = PTR_BYTE_ADD(&o.remote, 0);
         let pr = proxy_serve(req, pc, dz, route_idx,
                              m_ptr, m_len, p_ptr, p_len,
                              q_ptr, q_len,
-                             norm_ptr, resolved.len,
+                             norm_ptr, o.resbuf.len,
                              remote_ptr, o.remote_len, peer_known,
-                             dict_now());
+                             dict_now(), &o.tbuf, PTR_BYTE_ADD(&o.chunk, 0));
         o.status = pr.status;
         o.body_bytes = pr.body_bytes;
         return;
@@ -303,9 +322,9 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones, o: &
     // --- code-layer routing: pick the root, strip the alias prefix ---
     let strip: u64 = 0;
     let force_index: bool = false;
-    let use_assets: bool = config_route_is_assets(norm_ptr, resolved.len);
+    let use_assets: bool = config_route_is_assets(norm_ptr, o.resbuf.len);
     if use_assets {
-        if resolved.len == 6 {
+        if o.resbuf.len == 6 {
             strip = 6;
             force_index = true;
         } else {
@@ -313,32 +332,35 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones, o: &
         };
     };
     // --- build the filesystem candidate path ---
-    let cand: [u8; 1400] = [0u8; 1400];
+    // The candidate builder writes into the slot's persistent
+    // cand (knife1: the per-request [u8; 1400] local paid a
+    // full-size refill on every static request).
     let cand_len: u64 = 0;
     if use_assets {
         let ar = AssetsRoot { bytes: [0u8; 128], len: 0 };
         config_assets_root_into(&ar);
         let i: u64 = 0;
         while i < ar.len {
-            cand[cand_len] = ar.bytes[i];
+            o.cand[cand_len] = ar.bytes[i];
             cand_len = cand_len + 1;
             i = i + 1;
         }
     } else {
         let i: u64 = 0;
         while i < s.root_len {
-            cand[cand_len] = s.root[i];
+            o.cand[cand_len] = s.root[i];
             cand_len = cand_len + 1;
             i = i + 1;
         }
     };
-    let rel_len: u64 = resolved.len - strip;
+    let rel_len: u64 = o.resbuf.len - strip;
     if rel_len > 0 {
-        cand[cand_len] = 47;
+        o.cand[cand_len] = 47;
         cand_len = cand_len + 1;
         let i: u64 = 0;
         while i < rel_len {
-            cand[cand_len] = resolved.bytes[strip + i];
+            let cb: u8 = o.resbuf.bytes[strip + i];
+            o.cand[cand_len] = cb;
             cand_len = cand_len + 1;
             i = i + 1;
         }
@@ -347,22 +369,22 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones, o: &
     if rel_len == 0 {
         need_index = true;
     };
-    if resolved.ended_with_slash {
+    if o.resbuf.ended_with_slash {
         need_index = true;
     };
     if need_index {
         if cand_len > 0 {
-            cand[cand_len] = 47;
+            o.cand[cand_len] = 47;
             cand_len = cand_len + 1;
         };
         let i: u64 = 0;
         while i < s.index_len {
-            cand[cand_len] = s.index[i];
+            o.cand[cand_len] = s.index[i];
             cand_len = cand_len + 1;
             i = i + 1;
         }
     };
-    let cand_ptr: ptr = PTR_BYTE_ADD(&cand, 0);
+    let cand_ptr: ptr = PTR_BYTE_ADD(&o.cand, 0);
     // --- existence, with the directory-index fallback ---
     let file_len: u64 = 0;
     if sa_std_fs_len(cand_ptr, cand_len, &file_len) != 0 {
@@ -375,11 +397,11 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones, o: &
         // retry with /<index> appended (served directly; M0 does
         // not issue nginx's 301 -- registered in the delivery doc).
         let saved: u64 = cand_len;
-        cand[cand_len] = 47;
+        o.cand[cand_len] = 47;
         cand_len = cand_len + 1;
         let i: u64 = 0;
         while i < s.index_len {
-            cand[cand_len] = s.index[i];
+            o.cand[cand_len] = s.index[i];
             cand_len = cand_len + 1;
             i = i + 1;
         }
@@ -678,6 +700,10 @@ fn conn_slot_new(idx: u64) -> *ConnSlot {
             path: [0u8; 1024], path_len: 0,
             ua: [0u8; 256], ua_len: 0,
             remote: [0u8; 64], remote_len: 0,
+            resbuf: ResolvedPath { bytes: [0u8; 1024], len: 0, ended_with_slash: false },
+            cand: [0u8; 1400],
+            tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
+            chunk: [0u8; 4096],
         },
         trapped: false, trap_code: 0,
         handle: 0, busy: false, started: 0, seq: 0,
@@ -1165,6 +1191,10 @@ fn worker_state_new(idx: u64) -> *WorkerState {
             path: [0u8; 1024], path_len: 0,
             ua: [0u8; 256], ua_len: 0,
             remote: [0u8; 64], remote_len: 0,
+            resbuf: ResolvedPath { bytes: [0u8; 1024], len: 0, ended_with_slash: false },
+            cand: [0u8; 1400],
+            tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
+            chunk: [0u8; 4096],
         },
         outcome_b: Outcome {
             status: 0, body_bytes: 0,
@@ -1172,6 +1202,10 @@ fn worker_state_new(idx: u64) -> *WorkerState {
             path: [0u8; 1024], path_len: 0,
             ua: [0u8; 256], ua_len: 0,
             remote: [0u8; 64], remote_len: 0,
+            resbuf: ResolvedPath { bytes: [0u8; 1024], len: 0, ended_with_slash: false },
+            cand: [0u8; 1400],
+            tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
+            chunk: [0u8; 4096],
         },
         outcome_c: Outcome {
             status: 0, body_bytes: 0,
@@ -1179,6 +1213,10 @@ fn worker_state_new(idx: u64) -> *WorkerState {
             path: [0u8; 1024], path_len: 0,
             ua: [0u8; 256], ua_len: 0,
             remote: [0u8; 64], remote_len: 0,
+            resbuf: ResolvedPath { bytes: [0u8; 1024], len: 0, ended_with_slash: false },
+            cand: [0u8; 1400],
+            tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
+            chunk: [0u8; 4096],
         },
         outcome_d: Outcome {
             status: 0, body_bytes: 0,
@@ -1186,6 +1224,10 @@ fn worker_state_new(idx: u64) -> *WorkerState {
             path: [0u8; 1024], path_len: 0,
             ua: [0u8; 256], ua_len: 0,
             remote: [0u8; 64], remote_len: 0,
+            resbuf: ResolvedPath { bytes: [0u8; 1024], len: 0, ended_with_slash: false },
+            cand: [0u8; 1400],
+            tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
+            chunk: [0u8; 4096],
         },
         cur_slot: 0, log_seq: 0, log_done: 0,
         trap_line_pending: false, trap_seq: 0, trap_slot: 0,
