@@ -33,10 +33,14 @@ struct LogSink {
     ready: bool,
     bytes: [u8; 2048],
     len: u64,
+    // Caller-owned decimal scratch for sink_push_dec
+    // (DEF-SLANGINX-REQ-MEM-GROWTH): the by-value dec_u64
+    // return materialized on the heap twice per log line.
+    dec: DecText,
 }
 
 fn logsink_new() -> LogSink {
-    return LogSink { fh: 0, ready: false, bytes: [0u8; 2048], len: 0 };
+    return LogSink { fh: 0, ready: false, bytes: [0u8; 2048], len: 0, dec: DecText { bytes: [0u8; 20], len: 0 } };
 }
 
 fn sink_push(s: &LogSink, src: ptr, n: u64) {
@@ -58,10 +62,10 @@ fn sink_push_byte(s: &LogSink, b: u8) {
 }
 
 fn sink_push_dec(s: &LogSink, v: u64) {
-    let d = dec_u64(v);
+    dec_u64_into(v, &s.dec);
     let i: u64 = 0;
-    while i < d.len {
-        sink_push_byte(s, d.bytes[i]);
+    while i < s.dec.len {
+        sink_push_byte(s, s.dec.bytes[i]);
         i = i + 1;
     }
 }

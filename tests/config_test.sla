@@ -35,3 +35,21 @@
     if config_acl_allows(format("192.168.1.1")) { panic(236); };
     if config_acl_allows(format("not-an-ip")) { panic(237); };
 }
+
+// Bytes-form ACL (the request path): same decisions as the
+// String form, over raw peer bytes with caller-owned scratch.
+@test "bytes acl matches the string acl on v4, v6 and junk"() {
+    let oct = ipv4_octets_new();
+    let endb = u64box_new();
+    let pos = u64box_new();
+    let v = u64box_new();
+    if config_acl_allows_bytes(STR_PTR("8.8.8.8"), STR_LEN("8.8.8.8"), &oct, &endb, &pos, &v) { } else { panic(241); };
+    if config_acl_allows_bytes(STR_PTR("10.1.2.3"), STR_LEN("10.1.2.3"), &oct, &endb, &pos, &v) { panic(242); };
+    if config_acl_allows_bytes(STR_PTR("172.16.5.4"), STR_LEN("172.16.5.4"), &oct, &endb, &pos, &v) { panic(243); };
+    if config_acl_allows_bytes(STR_PTR("192.168.1.1"), STR_LEN("192.168.1.1"), &oct, &endb, &pos, &v) { panic(244); };
+    if config_acl_allows_bytes(STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1"), &oct, &endb, &pos, &v) { } else { panic(245); };
+    if config_acl_allows_bytes(STR_PTR("not-an-ip"), STR_LEN("not-an-ip"), &oct, &endb, &pos, &v) { panic(246); };
+    if config_acl_allows_bytes(STR_PTR("::1"), STR_LEN("::1"), &oct, &endb, &pos, &v) { } else { panic(247); };
+    if config_acl_allows_bytes(STR_PTR("2001:db8::1"), STR_LEN("2001:db8::1"), &oct, &endb, &pos, &v) { } else { panic(248); };
+    if config_acl_allows_bytes(STR_PTR("::ffff:192.0.2.1"), STR_LEN("::ffff:192.0.2.1"), &oct, &endb, &pos, &v) { } else { panic(249); };
+}

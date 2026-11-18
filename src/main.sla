@@ -71,7 +71,23 @@ struct Outcome {
     // they are filled once per slot; handle_request resets only
     // the length fields per request. One request at a time runs
     // per slot, so the scratch is never shared concurrently.
+    // decbuf is the resolver's percent-decode scratch, per-slot
+    // for the same reason (DEF-SLANGINX-REQ-MEM-GROWTH: as a
+    // per-call local inside webpath_resolve it materialized on
+    // the heap per request and was never reclaimed).
     resbuf: ResolvedPath,
+    decbuf: DecodedPath,
+    // Same class, same fix (DEF-SLANGINX-REQ-MEM-GROWTH):
+    // the per-request MimeType literal and the ACL's
+    // Ipv4Octets literal, both materialized per request.
+    mimebuf: MimeType,
+    acl_oct: Ipv4Octets,
+    // IPv4-parser working boxes (same fix, same defect):
+    // ipv4_parse_bytes / ipv4_parse_quad_at built one
+    // U64Box literal per call on the hot path.
+    acl_end: U64Box,
+    acl_pos: U64Box,
+    acl_v: U64Box,
     cand: [u8; 1400],
     tbuf: TextBuf,
     chunk: [u8; 4096],
@@ -238,7 +254,7 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones, o: &
     // the String-building form cost ~6,277 B/request of
     // unreclaimed temporaries (stage-2 slope segment 3).
     if peer_known {
-        if !config_acl_allows_bytes(peer_ptr, peer_len) {
+        if !config_acl_allows_bytes(peer_ptr, peer_len, &o.acl_oct, &o.acl_end, &o.acl_pos, &o.acl_v) {
             o.status = 403;
             o.body_bytes = send_simple(req, 403, STR_PTR("forbidden\n"), STR_LEN("forbidden\n"));
             return;
@@ -250,9 +266,11 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones, o: &
     // local paid a 1024-byte refill on every request; a by-value
     // resolved_new() return was already retired in stage 2 as
     // large-struct materialization). Only length/flag reset.
+    // The decode scratch is the slot's persistent decbuf for the
+    // same reason (DEF-SLANGINX-REQ-MEM-GROWTH).
     o.resbuf.len = 0;
     o.resbuf.ended_with_slash = false;
-    let rrc: i32 = webpath_resolve(p_ptr, p_len, &o.resbuf);
+    let rrc: i32 = webpath_resolve(p_ptr, p_len, &o.decbuf, &o.resbuf);
     if rrc == 1 {
         o.status = 403;
         o.body_bytes = send_simple(req, 403, STR_PTR("forbidden\n"), STR_LEN("forbidden\n"));
@@ -412,9 +430,11 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones, o: &
         };
     };
     // --- content type by extension ---
-    let mime = MimeType { bytes: [0u8; 40], len: 0 };
-    webpath_mime(cand_ptr, cand_len, &mime);
-    let mime_ptr: ptr = PTR_BYTE_ADD(&mime.bytes, 0);
+    // Filled into the slot's persistent mimebuf
+    // (DEF-SLANGINX-REQ-MEM-GROWTH): the per-request
+    // MimeType literal materialized on the heap per request.
+    webpath_mime(cand_ptr, cand_len, &o.mimebuf);
+    let mime_ptr: ptr = PTR_BYTE_ADD(&o.mimebuf.bytes, 0);
     // --- HEAD: headers only, no body bytes on the wire ---
     // G1 backfilled in M1: the std server face now has a
     // header-only send shape (sa_http_server_resp_send_head_v2),
@@ -428,7 +448,7 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones, o: &
             o.status = 500;
             return;
         };
-        sa_http_server_resp_add_header_v2(resp, STR_PTR("content-type"), STR_LEN("content-type"), mime_ptr, mime.len);
+        sa_http_server_resp_add_header_v2(resp, STR_PTR("content-type"), STR_LEN("content-type"), mime_ptr, o.mimebuf.len);
         if sa_http_server_resp_send_head_v2(resp, file_len, 5000) != 0 {
             o.body_bytes = 0;
         };
@@ -468,7 +488,7 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones, o: &
         o.body_bytes = 0;
         return;
     };
-    sa_http_server_resp_add_header_v2(resp, STR_PTR("content-type"), STR_LEN("content-type"), mime_ptr, mime.len);
+    sa_http_server_resp_add_header_v2(resp, STR_PTR("content-type"), STR_LEN("content-type"), mime_ptr, o.mimebuf.len);
     let sent: u64 = 0;
     let fst: u32 = sa_http_server_resp_send_file_v2(resp, raw_fd as i64, 0, file_len, 5000, &sent);
     sa_http_server_resp_free_v2(resp);
@@ -701,6 +721,12 @@ fn conn_slot_new(idx: u64) -> *ConnSlot {
             ua: [0u8; 256], ua_len: 0,
             remote: [0u8; 64], remote_len: 0,
             resbuf: ResolvedPath { bytes: [0u8; 1024], len: 0, ended_with_slash: false },
+            decbuf: DecodedPath { bytes: [0u8; 1024], len: 0 },
+            mimebuf: MimeType { bytes: [0u8; 40], len: 0 },
+            acl_oct: Ipv4Octets { a: 0, b: 0, c: 0, d: 0 },
+            acl_end: U64Box { value: 0 },
+            acl_pos: U64Box { value: 0 },
+            acl_v: U64Box { value: 0 },
             cand: [0u8; 1400],
             tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
             chunk: [0u8; 4096],
@@ -988,6 +1014,14 @@ fn serve_generation(ctx: *ServerCtx) -> i32 {
         i = i + 1;
     }
     let traps = TrapState { count: 0, window_start: dict_now() };
+    // One receive/select box per generation, reused across
+    // iterations (DEF-SLANGINX-REQ-MEM-GROWTH): the per-record
+    // literals materialized on the heap per request.
+    // try_recv_completion / select_completion reset every
+    // field on entry, so reuse is safe.
+    let rb = RecvBox { payload: 0, got: false, closed: false };
+    let sb = SelectBox { kind: 0, idx: 0, req: PTR_NULL(), closed: false };
+    let sb2 = SelectBox { kind: 0, idx: 0, req: PTR_NULL(), closed: false };
     let iter: u64 = 0;
     let last_scan: u64 = dict_now();
     while true {
@@ -1005,7 +1039,6 @@ fn serve_generation(ctx: *ServerCtx) -> i32 {
         // Drain every queued completion first.
         let progressed: bool = true;
         while progressed {
-            let rb = RecvBox { payload: 0, got: false, closed: false };
             try_recv_completion(ctx, &rb);
             if rb.closed {
                 return 3;
@@ -1025,7 +1058,6 @@ fn serve_generation(ctx: *ServerCtx) -> i32 {
             if book.in_flight == 0 {
                 return 0;
             };
-            let sb = SelectBox { kind: 0, idx: 0, req: PTR_NULL(), closed: false };
             select_completion(ctx, &sb);
             if sb.closed {
                 return 3;
@@ -1044,7 +1076,6 @@ fn serve_generation(ctx: *ServerCtx) -> i32 {
         } else {
             if book.free_top == 0 {
                 // All slots busy: park on the next completion.
-                let sb2 = SelectBox { kind: 0, idx: 0, req: PTR_NULL(), closed: false };
                 select_completion(ctx, &sb2);
                 if sb2.closed {
                     return 3;
@@ -1192,6 +1223,12 @@ fn worker_state_new(idx: u64) -> *WorkerState {
             ua: [0u8; 256], ua_len: 0,
             remote: [0u8; 64], remote_len: 0,
             resbuf: ResolvedPath { bytes: [0u8; 1024], len: 0, ended_with_slash: false },
+            decbuf: DecodedPath { bytes: [0u8; 1024], len: 0 },
+            mimebuf: MimeType { bytes: [0u8; 40], len: 0 },
+            acl_oct: Ipv4Octets { a: 0, b: 0, c: 0, d: 0 },
+            acl_end: U64Box { value: 0 },
+            acl_pos: U64Box { value: 0 },
+            acl_v: U64Box { value: 0 },
             cand: [0u8; 1400],
             tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
             chunk: [0u8; 4096],
@@ -1203,6 +1240,12 @@ fn worker_state_new(idx: u64) -> *WorkerState {
             ua: [0u8; 256], ua_len: 0,
             remote: [0u8; 64], remote_len: 0,
             resbuf: ResolvedPath { bytes: [0u8; 1024], len: 0, ended_with_slash: false },
+            decbuf: DecodedPath { bytes: [0u8; 1024], len: 0 },
+            mimebuf: MimeType { bytes: [0u8; 40], len: 0 },
+            acl_oct: Ipv4Octets { a: 0, b: 0, c: 0, d: 0 },
+            acl_end: U64Box { value: 0 },
+            acl_pos: U64Box { value: 0 },
+            acl_v: U64Box { value: 0 },
             cand: [0u8; 1400],
             tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
             chunk: [0u8; 4096],
@@ -1214,6 +1257,12 @@ fn worker_state_new(idx: u64) -> *WorkerState {
             ua: [0u8; 256], ua_len: 0,
             remote: [0u8; 64], remote_len: 0,
             resbuf: ResolvedPath { bytes: [0u8; 1024], len: 0, ended_with_slash: false },
+            decbuf: DecodedPath { bytes: [0u8; 1024], len: 0 },
+            mimebuf: MimeType { bytes: [0u8; 40], len: 0 },
+            acl_oct: Ipv4Octets { a: 0, b: 0, c: 0, d: 0 },
+            acl_end: U64Box { value: 0 },
+            acl_pos: U64Box { value: 0 },
+            acl_v: U64Box { value: 0 },
             cand: [0u8; 1400],
             tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
             chunk: [0u8; 4096],
@@ -1225,6 +1274,12 @@ fn worker_state_new(idx: u64) -> *WorkerState {
             ua: [0u8; 256], ua_len: 0,
             remote: [0u8; 64], remote_len: 0,
             resbuf: ResolvedPath { bytes: [0u8; 1024], len: 0, ended_with_slash: false },
+            decbuf: DecodedPath { bytes: [0u8; 1024], len: 0 },
+            mimebuf: MimeType { bytes: [0u8; 40], len: 0 },
+            acl_oct: Ipv4Octets { a: 0, b: 0, c: 0, d: 0 },
+            acl_end: U64Box { value: 0 },
+            acl_pos: U64Box { value: 0 },
+            acl_v: U64Box { value: 0 },
             cand: [0u8; 1400],
             tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
             chunk: [0u8; 4096],
@@ -1626,8 +1681,14 @@ fn serve_merged_generation(ctx: *ServerCtx, traps: &TrapState) -> i32 {
         i = i + 1;
     }
     let events: u64 = 0;
+    // One ExitBox per generation, reused across iterations and
+    // drain records (DEF-SLANGINX-REQ-MEM-GROWTH): the per-
+    // record literal materialized on the heap per request.
+    // select_exit / select_exit_poll reset every field on
+    // entry, so reuse is safe.
+    let eb = ExitBox { payload: 0, kind: 0, closed: false };
+    let db = ExitBox { payload: 0, kind: 0, closed: false };
     while events < GEN_EVENT_BUDGET {
-        let eb = ExitBox { payload: 0, kind: 0, closed: false };
         select_exit(ctx, &eb);
         if eb.closed {
             return 3;
@@ -1645,7 +1706,6 @@ fn serve_merged_generation(ctx: *ServerCtx, traps: &TrapState) -> i32 {
             // wake cost is paid once per batch, not per record.
             let draining: bool = true;
             while draining {
-                let db = ExitBox { payload: 0, kind: 0, closed: false };
                 select_exit_poll(ctx, &db);
                 if db.closed {
                     return 3;

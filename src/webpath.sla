@@ -33,6 +33,10 @@ fn resolved_new() -> ResolvedPath {
     return ResolvedPath { bytes: [0u8; 1024], len: 0, ended_with_slash: false };
 }
 
+fn decoded_new() -> DecodedPath {
+    return DecodedPath { bytes: [0u8; 1024], len: 0 };
+}
+
 fn hex_val(b: u8) -> i32 {
     if b >= 48 {
         if b <= 57 {
@@ -97,7 +101,7 @@ fn resolved_text_eq(r: &ResolvedPath, lit: ptr, lit_len: u64) -> bool {
     return true;
 }
 
-fn webpath_resolve(raw: ptr, raw_len: u64, out: &ResolvedPath) -> i32 {
+fn webpath_resolve(raw: ptr, raw_len: u64, dec: &DecodedPath, out: &ResolvedPath) -> i32 {
     // 1. The path portion ends at '?' or '#'.
     let plen: u64 = 0;
     let scanning: bool = true;
@@ -117,8 +121,13 @@ fn webpath_resolve(raw: ptr, raw_len: u64, out: &ResolvedPath) -> i32 {
             };
         };
     }
-    // 2. Percent-decode into scratch.
-    let dec = DecodedPath { bytes: [0u8; 1024], len: 0 };
+    // 2. Percent-decode into scratch. The scratch is caller-owned
+    // (DEF-SLANGINX-REQ-MEM-GROWTH): a per-call DecodedPath value
+    // local materializes on the heap on this toolchain and is
+    // never reclaimed (~2 KB retained per request, measured);
+    // only its length is reset here, bytes past len are never
+    // read.
+    dec.len = 0;
     let i: u64 = 0;
     while i < plen {
         let b: u8 = PTR_BYTE_AT(raw, i);
@@ -179,7 +188,7 @@ fn webpath_resolve(raw: ptr, raw_len: u64, out: &ResolvedPath) -> i32 {
             };
             if at_end {
                 if seg < pos {
-                    let rc: i32 = push_segment(&dec, seg, pos, out);
+                    let rc: i32 = push_segment(dec, seg, pos, out);
                     if rc != 0 {
                         return rc;
                     };
@@ -188,7 +197,7 @@ fn webpath_resolve(raw: ptr, raw_len: u64, out: &ResolvedPath) -> i32 {
             } else {
                 if at_sep {
                     if seg < pos {
-                        let rc: i32 = push_segment(&dec, seg, pos, out);
+                        let rc: i32 = push_segment(dec, seg, pos, out);
                         if rc != 0 {
                             return rc;
                         };

@@ -7,12 +7,17 @@ struct DecText {
     len: u64,
 }
 
-fn dec_u64(v: u64) -> DecText {
-    let t = DecText { bytes: [0u8; 20], len: 0 };
+// Fill a caller-owned DecText in place. The by-value dec_u64
+// form below is kept for tests only: a DecText returned by
+// value materializes on the heap per call and is not reclaimed
+// (DEF-SLANGINX-REQ-MEM-GROWTH), and the log path calls this
+// twice per request.
+fn dec_u64_into(v: u64, t: &DecText) {
+    t.len = 0;
     if v == 0 {
         t.bytes[0] = 48;
         t.len = 1;
-        return t;
+        return;
     };
     let tmp: [u8; 20] = [0u8; 20];
     let n: u64 = 0;
@@ -28,5 +33,10 @@ fn dec_u64(v: u64) -> DecText {
         i = i + 1;
     }
     t.len = n;
+}
+
+fn dec_u64(v: u64) -> DecText {
+    let t = DecText { bytes: [0u8; 20], len: 0 };
+    dec_u64_into(v, &t);
     return t;
 }

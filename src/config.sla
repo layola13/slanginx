@@ -163,6 +163,17 @@ struct U64Box {
     value: u64,
 }
 
+// Constructors for the ACL scratch structs (tests and any
+// caller that needs a fresh value; the request path reuses
+// the slot-owned fields instead -- see config_acl_allows_bytes).
+fn ipv4_octets_new() -> Ipv4Octets {
+    return Ipv4Octets { a: 0, b: 0, c: 0, d: 0 };
+}
+
+fn u64box_new() -> U64Box {
+    return U64Box { value: 0 };
+}
+
 // Parse one dotted-quad part starting at pos.value: 1-3 digits, a
 // multi-digit part may not start with '0', value <= 255. On
 // success stores the value and advances pos past the digits.
@@ -215,10 +226,13 @@ fn ipv4_part(p: ptr, n: u64, pos: &U64Box, out: &U64Box) -> bool {
 // part rules: exactly four parts joined by '.'. On success the
 // octets are stored and end_out holds the offset just past the
 // last digit (the caller decides whether more text may follow).
-fn ipv4_parse_quad_at(p: ptr, n: u64, start: u64, oct: &Ipv4Octets, end_out: &U64Box) -> bool {
-    let pos = U64Box { value: start };
-    let v = U64Box { value: 0 };
-    if !ipv4_part(p, n, &pos, &v) {
+fn ipv4_parse_quad_at(p: ptr, n: u64, start: u64, oct: &Ipv4Octets, end_out: &U64Box, pos: &U64Box, v: &U64Box) -> bool {
+    // pos/v are caller-owned scratch (DEF-SLANGINX-REQ-
+    // MEM-GROWTH): the per-call U64Box literals materialized
+    // on the heap per request. Initialized here on entry.
+    pos.value = start;
+    v.value = 0;
+    if !ipv4_part(p, n, pos, v) {
         return false;
     };
     oct.a = v.value;
@@ -229,7 +243,7 @@ fn ipv4_parse_quad_at(p: ptr, n: u64, start: u64, oct: &Ipv4Octets, end_out: &U6
         return false;
     };
     pos.value = pos.value + 1;
-    if !ipv4_part(p, n, &pos, &v) {
+    if !ipv4_part(p, n, pos, v) {
         return false;
     };
     oct.b = v.value;
@@ -240,7 +254,7 @@ fn ipv4_parse_quad_at(p: ptr, n: u64, start: u64, oct: &Ipv4Octets, end_out: &U6
         return false;
     };
     pos.value = pos.value + 1;
-    if !ipv4_part(p, n, &pos, &v) {
+    if !ipv4_part(p, n, pos, v) {
         return false;
     };
     oct.c = v.value;
@@ -251,7 +265,7 @@ fn ipv4_parse_quad_at(p: ptr, n: u64, start: u64, oct: &Ipv4Octets, end_out: &U6
         return false;
     };
     pos.value = pos.value + 1;
-    if !ipv4_part(p, n, &pos, &v) {
+    if !ipv4_part(p, n, pos, v) {
         return false;
     };
     oct.d = v.value;
@@ -260,10 +274,10 @@ fn ipv4_parse_quad_at(p: ptr, n: u64, start: u64, oct: &Ipv4Octets, end_out: &U6
 }
 
 // Full dotted-quad parse over raw bytes, mirroring ipv4_parse:
-// the quad must consume the whole text.
-fn ipv4_parse_bytes(p: ptr, n: u64, oct: &Ipv4Octets) -> bool {
-    let endb = U64Box { value: 0 };
-    if !ipv4_parse_quad_at(p, n, 0, oct, &endb) {
+// the quad must consume the whole text. The boxes are
+// caller-owned scratch (see ipv4_parse_quad_at).
+fn ipv4_parse_bytes(p: ptr, n: u64, oct: &Ipv4Octets, endb: &U64Box, pos: &U64Box, v: &U64Box) -> bool {
+    if !ipv4_parse_quad_at(p, n, 0, oct, endb, pos, v) {
         return false;
     };
     return endb.value == n;
@@ -289,8 +303,10 @@ fn hex_val_byte(b: u8) -> bool {
 }
 
 // Accept/reject mirror of sa_std ipv6_parse (see the section
-// comment above). Counts explicit segments only.
-fn ipv6_text_valid(p: ptr, n: u64) -> bool {
+// comment above). Counts explicit segments only. The oct/endb/
+// pos/v scratch is caller-owned (DEF-SLANGINX-REQ-MEM-
+// GROWTH), threaded from the ACL entry point.
+fn ipv6_text_valid(p: ptr, n: u64, oct: &Ipv4Octets, endb: &U64Box, pos: &U64Box, v: &U64Box) -> bool {
     if n == 0 {
         return false;
     };
@@ -334,9 +350,7 @@ fn ipv6_text_valid(p: ptr, n: u64) -> bool {
                 // the IPv4 rules; it occupies two segment slots,
                 // and the separator logic below applies after it
                 // exactly as in ipv6_parse.
-                let oct = Ipv4Octets { a: 0, b: 0, c: 0, d: 0 };
-                let endb = U64Box { value: 0 };
-                if !ipv4_parse_quad_at(p, n, seg_start, &oct, &endb) {
+                if !ipv4_parse_quad_at(p, n, seg_start, oct, endb, pos, v) {
                     return false;
                 };
                 total = total + 2;
@@ -382,7 +396,12 @@ fn ipv6_text_valid(p: ptr, n: u64) -> bool {
 
 // The request-path ACL: same decisions as config_acl_allows,
 // computed over the peer's raw bytes with no String built.
-fn config_acl_allows_bytes(p: ptr, n: u64) -> bool {
+// The octets scratch is caller-owned (DEF-SLANGINX-REQ-
+// MEM-GROWTH): a per-call Ipv4Octets literal materializes on
+// the heap per request and is not reclaimed. ipv4_parse_bytes
+// fills all four fields before it can return true, and the
+// caller reads them only on the true path.
+fn config_acl_allows_bytes(p: ptr, n: u64, oct: &Ipv4Octets, endb: &U64Box, pos: &U64Box, v: &U64Box) -> bool {
     let has_colon: bool = false;
     let i: u64 = 0;
     while i < n {
@@ -393,10 +412,9 @@ fn config_acl_allows_bytes(p: ptr, n: u64) -> bool {
         i = i + 1;
     }
     if has_colon {
-        return ipv6_text_valid(p, n);
+        return ipv6_text_valid(p, n, oct, endb, pos, v);
     };
-    let oct = Ipv4Octets { a: 0, b: 0, c: 0, d: 0 };
-    if !ipv4_parse_bytes(p, n, &oct) {
+    if !ipv4_parse_bytes(p, n, oct, endb, pos, v) {
         return false;
     };
     if oct.a == 10 {
