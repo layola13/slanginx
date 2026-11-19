@@ -97,6 +97,10 @@ struct Outcome {
     // proxied request and never reclaimed. proxy.sla fills
     // this in place; only length fields reset per request.
     px: ProxyScratch,
+    // Out-box for proxy_serve's result (same class): the
+    // by-value ProxyResult return materialized per request.
+    pres: ProxyResult,
+    pattempt: AttemptResult,
     chunk: [u8; 4096],
 }
 
@@ -314,14 +318,14 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones, o: &
     let route_idx: i32 = proxyconf_route_match(pc, norm_ptr, o.resbuf.len);
     if route_idx >= 0 {
         let remote_ptr: ptr = PTR_BYTE_ADD(&o.remote, 0);
-        let pr = proxy_serve(req, pc, dz, route_idx,
-                             m_ptr, m_len, p_ptr, p_len,
-                             q_ptr, q_len,
-                             norm_ptr, o.resbuf.len,
-                             remote_ptr, o.remote_len, peer_known,
-                             dict_now(), &o.tbuf, PTR_BYTE_ADD(&o.chunk, 0), &o.px);
-        o.status = pr.status;
-        o.body_bytes = pr.body_bytes;
+        proxy_serve(req, pc, dz, route_idx,
+                    m_ptr, m_len, p_ptr, p_len,
+                    q_ptr, q_len,
+                    norm_ptr, o.resbuf.len,
+                    remote_ptr, o.remote_len, peer_known,
+                    dict_now(), &o.tbuf, PTR_BYTE_ADD(&o.chunk, 0), &o.px, &o.pattempt, &o.pres);
+        o.status = o.pres.status;
+        o.body_bytes = o.pres.body_bytes;
         return;
     };
     // --- method gate for the static face (proxy routes accept
@@ -737,6 +741,8 @@ fn conn_slot_new(idx: u64) -> *ConnSlot {
             cand: [0u8; 1400],
             tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
             px: proxy_scratch_new(),
+            pres: ProxyResult { status: 0, body_bytes: 0 },
+            pattempt: AttemptResult { relayed: false, net_status: 0, status: 0, body_bytes: 0 },
             chunk: [0u8; 4096],
         },
         trapped: false, trap_code: 0,
@@ -1240,6 +1246,8 @@ fn worker_state_new(idx: u64) -> *WorkerState {
             cand: [0u8; 1400],
             tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
             px: proxy_scratch_new(),
+            pres: ProxyResult { status: 0, body_bytes: 0 },
+            pattempt: AttemptResult { relayed: false, net_status: 0, status: 0, body_bytes: 0 },
             chunk: [0u8; 4096],
         },
         outcome_b: Outcome {
@@ -1258,6 +1266,8 @@ fn worker_state_new(idx: u64) -> *WorkerState {
             cand: [0u8; 1400],
             tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
             px: proxy_scratch_new(),
+            pres: ProxyResult { status: 0, body_bytes: 0 },
+            pattempt: AttemptResult { relayed: false, net_status: 0, status: 0, body_bytes: 0 },
             chunk: [0u8; 4096],
         },
         outcome_c: Outcome {
@@ -1276,6 +1286,8 @@ fn worker_state_new(idx: u64) -> *WorkerState {
             cand: [0u8; 1400],
             tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
             px: proxy_scratch_new(),
+            pres: ProxyResult { status: 0, body_bytes: 0 },
+            pattempt: AttemptResult { relayed: false, net_status: 0, status: 0, body_bytes: 0 },
             chunk: [0u8; 4096],
         },
         outcome_d: Outcome {
@@ -1294,6 +1306,8 @@ fn worker_state_new(idx: u64) -> *WorkerState {
             cand: [0u8; 1400],
             tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
             px: proxy_scratch_new(),
+            pres: ProxyResult { status: 0, body_bytes: 0 },
+            pattempt: AttemptResult { relayed: false, net_status: 0, status: 0, body_bytes: 0 },
             chunk: [0u8; 4096],
         },
         cur_slot: 0, log_seq: 0, log_done: 0,

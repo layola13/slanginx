@@ -344,8 +344,13 @@ fn proxy_attempt(req: ptr, pc: &ProxyConfig, slot: u64,
                  method_code: u8,
                  target: ptr, target_len: u64,
                  peer: ptr, peer_len: u64, peer_known: bool,
-                 chunk_bp: ptr, sc: &ProxyScratch) -> AttemptResult {
-    let ar = AttemptResult { relayed: false, net_status: 6, status: 0, body_bytes: 0 };
+                 chunk_bp: ptr, sc: &ProxyScratch, ar: &AttemptResult) {
+    // ar is the caller's scratch (Outcome.pattempt): the
+    // by-value AttemptResult return materialized per attempt.
+    ar.relayed = false;
+    ar.net_status = 6;
+    ar.status = 0;
+    ar.body_bytes = 0;
     // URL: http://host:port<target>. Built in the caller's
     // scratch (see ProxyScratch); only its length resets.
     sc.url.len = 0;
@@ -367,13 +372,13 @@ fn proxy_attempt(req: ptr, pc: &ProxyConfig, slot: u64,
     let client: ptr = PTR_NULL();
     if sa_http_client_new_v2(0, STR_PTR(""), 0, &client) != 0 {
         ar.net_status = 6;
-        return ar;
+        return;
     };
     let ureq: ptr = PTR_NULL();
     if sa_http_client_req_new_v2(client, method_code, url_ptr, sc.url.len, &ureq) != 0 {
         sa_http_client_free(client);
         ar.net_status = 5;
-        return ar;
+        return;
     };
     proxy_forward_headers(req, ureq, peer, peer_len, peer_known, sc);
     if method_code != 1 {
@@ -394,7 +399,7 @@ fn proxy_attempt(req: ptr, pc: &ProxyConfig, slot: u64,
         sa_http_client_req_free(ureq);
         sa_http_client_free(client);
         ar.net_status = st;
-        return ar;
+        return;
     };
     ar.status = sa_http_client_resp_status(uresp) as u32;
     if method_code == 5 {
@@ -458,7 +463,7 @@ fn proxy_attempt(req: ptr, pc: &ProxyConfig, slot: u64,
     sa_http_client_req_free(ureq);
     sa_http_client_free(client);
     ar.relayed = true;
-    return ar;
+    return;
 }
 
 // --- entry point, called from the server core ---
@@ -470,14 +475,17 @@ fn proxy_serve(req: ptr, pc: &ProxyConfig, dz: &DictZones,
                query_ptr: ptr, query_len: u64,
                norm_ptr: ptr, norm_len: u64,
                peer_ptr: ptr, peer_len: u64, peer_known: bool,
-               now: u64, tbuf: &TextBuf, chunk_bp: ptr, sc: &ProxyScratch) -> ProxyResult {
-    let res = ProxyResult { status: 0, body_bytes: 0 };
+               now: u64, tbuf: &TextBuf, chunk_bp: ptr, sc: &ProxyScratch, ar: &AttemptResult, res: &ProxyResult) {
+    // res is the caller's out-box (Outcome.pres): the by-value
+    // ProxyResult return materialized per proxied request.
+    res.status = 0;
+    res.body_bytes = 0;
     let pool_idx: u64 = pc.route_pools[route_idx as u64];
     let code: u8 = proxy_method_code(method_ptr, method_len);
     if code == 0 {
         res.status = 405;
         res.body_bytes = proxy_send_simple(req, 405, STR_PTR("method not allowed\n"), STR_LEN("method not allowed\n"));
-        return res;
+        return;
     };
     // Forward target: "/" + normalized path, plus "?" + the raw
     // query string when the request carried one (G4: the query
@@ -503,11 +511,11 @@ fn proxy_serve(req: ptr, pc: &ProxyConfig, dz: &DictZones,
     let attempt: u64 = 0;
     while attempt < server_count {
         let slot: u64 = proxyconf_pool_pick(pc, pool_idx);
-        let ar = proxy_attempt(req, pc, slot, code, target_ptr, tbuf.len, peer_ptr, peer_len, peer_known, chunk_bp, sc);
+        proxy_attempt(req, pc, slot, code, target_ptr, tbuf.len, peer_ptr, peer_len, peer_known, chunk_bp, sc, ar);
         if ar.relayed {
             res.status = ar.status;
             res.body_bytes = ar.body_bytes;
-            return res;
+            return;
         };
         last_status = ar.net_status;
         attempt = attempt + 1;
@@ -516,9 +524,9 @@ fn proxy_serve(req: ptr, pc: &ProxyConfig, dz: &DictZones,
     if last_status == 3 {
         res.status = 504;
         res.body_bytes = proxy_send_simple(req, 504, STR_PTR("gateway timeout\n"), STR_LEN("gateway timeout\n"));
-        return res;
+        return;
     };
     res.status = 502;
     res.body_bytes = proxy_send_simple(req, 502, STR_PTR("bad gateway\n"), STR_LEN("bad gateway\n"));
-    return res;
+    return;
 }
