@@ -68,6 +68,37 @@ struct TextBuf {
 // site, never returned by value: a by-value return of this
 // 1608-byte struct materializes on the heap per call and is not
 // reclaimed (stage-2 slope fix; see docs/GOROUTINE_DELIVERY.md).
+//
+// Per-request scratch for the proxy/status route, caller-owned
+// (one per handler slot, a field of main.sla's Outcome) and
+// filled in place: the per-call TextBuf literals in stats_incr /
+// stats_read / proxy_status_body / proxy_attempt /
+// proxy_forward_headers and the by-value dec_u64 inside
+// tb_push_dec are the same materialization class the static/log
+// path retired (DEF-SLANGINX-REQ-MEM-GROWTH follow-up): each one
+// heap-materializes per proxied request and is never reclaimed.
+// Every fill below resets only the length fields on entry; one
+// request at a time runs per slot, so the scratch is never
+// shared concurrently.
+struct ProxyScratch {
+    zname: TextBuf,
+    key: TextBuf,
+    url: TextBuf,
+    xff: TextBuf,
+    dec: DecText,
+    num: DictNum,
+}
+
+fn proxy_scratch_new() -> ProxyScratch {
+    return ProxyScratch {
+        zname: TextBuf { bytes: [0u8; 1600], len: 0 },
+        key: TextBuf { bytes: [0u8; 1600], len: 0 },
+        url: TextBuf { bytes: [0u8; 1600], len: 0 },
+        xff: TextBuf { bytes: [0u8; 1600], len: 0 },
+        dec: DecText { bytes: [0u8; 20], len: 0 },
+        num: DictNum { value: 0 },
+    };
+}
 
 fn tb_push(t: &TextBuf, src: ptr, n: u64) {
     let i: u64 = 0;
@@ -87,11 +118,14 @@ fn tb_push_byte(t: &TextBuf, b: u8) {
     };
 }
 
-fn tb_push_dec(t: &TextBuf, v: u64) {
-    let d = dec_u64(v);
+fn tb_push_dec(t: &TextBuf, v: u64, dec: &DecText) {
+    // The decimal form is filled into the caller-owned scratch:
+    // the by-value dec_u64 return materialized a DecText on the
+    // heap per call (same class as the log path's sink_push_dec).
+    dec_u64_into(v, dec);
     let i: u64 = 0;
-    while i < d.len {
-        tb_push_byte(t, d.bytes[i]);
+    while i < dec.len {
+        tb_push_byte(t, dec.bytes[i]);
         i = i + 1;
     }
 }
@@ -172,40 +206,42 @@ fn stats_key(pc: &ProxyConfig, pool_idx: u64, what: ptr, what_len: u64, out: &Te
     tb_push(out, what, what_len);
 }
 
-fn stats_incr(pc: &ProxyConfig, dz: &DictZones, pool_idx: u64, what: ptr, what_len: u64, now: u64) {
-    let zname = TextBuf { bytes: [0u8; 1600], len: 0 };
-    if stats_zone(dz, &zname) < 0 {
+fn stats_incr(pc: &ProxyConfig, dz: &DictZones, pool_idx: u64, what: ptr, what_len: u64, now: u64, sc: &ProxyScratch) {
+    // zname/key/num are the caller's per-slot scratch (see
+    // ProxyScratch): the per-call literals materialized two
+    // 1608-byte TextBufs plus a DictNum on the heap per proxied
+    // request. Only the lengths reset on entry.
+    sc.zname.len = 0;
+    if stats_zone(dz, &sc.zname) < 0 {
         return;
     };
-    let key = TextBuf { bytes: [0u8; 1600], len: 0 };
-    stats_key(pc, pool_idx, what, what_len, &key);
-    let zp: ptr = PTR_BYTE_ADD(&zname.bytes, 0);
-    let kp: ptr = PTR_BYTE_ADD(&key.bytes, 0);
-    let res = DictNum { value: 0 };
-    dict_incr(zp, zname.len, kp, key.len, 1, 0, now, &res);
+    sc.key.len = 0;
+    stats_key(pc, pool_idx, what, what_len, &sc.key);
+    let zp: ptr = PTR_BYTE_ADD(&sc.zname.bytes, 0);
+    let kp: ptr = PTR_BYTE_ADD(&sc.key.bytes, 0);
+    dict_incr(zp, sc.zname.len, kp, sc.key.len, 1, 0, now, &sc.num);
 }
 
-fn stats_read(pc: &ProxyConfig, dz: &DictZones, pool_idx: u64, what: ptr, what_len: u64, now: u64) -> u64 {
-    let zname = TextBuf { bytes: [0u8; 1600], len: 0 };
-    if stats_zone(dz, &zname) < 0 {
+fn stats_read(pc: &ProxyConfig, dz: &DictZones, pool_idx: u64, what: ptr, what_len: u64, now: u64, sc: &ProxyScratch) -> u64 {
+    sc.zname.len = 0;
+    if stats_zone(dz, &sc.zname) < 0 {
         return 0;
     };
-    let key = TextBuf { bytes: [0u8; 1600], len: 0 };
-    stats_key(pc, pool_idx, what, what_len, &key);
-    let zp: ptr = PTR_BYTE_ADD(&zname.bytes, 0);
-    let kp: ptr = PTR_BYTE_ADD(&key.bytes, 0);
-    let res = DictNum { value: 0 };
-    if dict_get_num(zp, zname.len, kp, key.len, &res, now) != 0 {
+    sc.key.len = 0;
+    stats_key(pc, pool_idx, what, what_len, &sc.key);
+    let zp: ptr = PTR_BYTE_ADD(&sc.zname.bytes, 0);
+    let kp: ptr = PTR_BYTE_ADD(&sc.key.bytes, 0);
+    if dict_get_num(zp, sc.zname.len, kp, sc.key.len, &sc.num, now) != 0 {
         return 0;
     };
-    return res.value;
+    return sc.num.value;
 }
 
 // Body of the code-layer status route. Returns 0 when the
 // stats zone is declared (body built), 1 when it is not.
-fn proxy_status_body(pc: &ProxyConfig, dz: &DictZones, out: &TextBuf, now: u64) -> i32 {
-    let zname = TextBuf { bytes: [0u8; 1600], len: 0 };
-    if stats_zone(dz, &zname) < 0 {
+fn proxy_status_body(pc: &ProxyConfig, dz: &DictZones, out: &TextBuf, now: u64, sc: &ProxyScratch) -> i32 {
+    sc.zname.len = 0;
+    if stats_zone(dz, &sc.zname) < 0 {
         return 1;
     };
     tb_push(out, STR_PTR("slanginx status\n"), STR_LEN("slanginx status\n"));
@@ -218,9 +254,9 @@ fn proxy_status_body(pc: &ProxyConfig, dz: &DictZones, out: &TextBuf, now: u64) 
             j = j + 1;
         }
         tb_push(out, STR_PTR(" requests "), STR_LEN(" requests "));
-        tb_push_dec(out, stats_read(pc, dz, i, STR_PTR("requests"), STR_LEN("requests"), now));
+        tb_push_dec(out, stats_read(pc, dz, i, STR_PTR("requests"), STR_LEN("requests"), now, sc), &sc.dec);
         tb_push(out, STR_PTR(" errors "), STR_LEN(" errors "));
-        tb_push_dec(out, stats_read(pc, dz, i, STR_PTR("errors"), STR_LEN("errors"), now));
+        tb_push_dec(out, stats_read(pc, dz, i, STR_PTR("errors"), STR_LEN("errors"), now, sc), &sc.dec);
         tb_push_byte(out, 10);
         i = i + 1;
     }
@@ -237,7 +273,7 @@ fn forward_one_header(req: ptr, ureq: ptr, name: ptr, name_len: u64) {
     };
 }
 
-fn proxy_forward_headers(req: ptr, ureq: ptr, peer: ptr, peer_len: u64, peer_known: bool) {
+fn proxy_forward_headers(req: ptr, ureq: ptr, peer: ptr, peer_len: u64, peer_known: bool, sc: &ProxyScratch) {
     forward_one_header(req, ureq, STR_PTR("accept"), STR_LEN("accept"));
     forward_one_header(req, ureq, STR_PTR("accept-language"), STR_LEN("accept-language"));
     forward_one_header(req, ureq, STR_PTR("accept-encoding"), STR_LEN("accept-encoding"));
@@ -247,23 +283,24 @@ fn proxy_forward_headers(req: ptr, ureq: ptr, peer: ptr, peer_len: u64, peer_kno
     forward_one_header(req, ureq, STR_PTR("referer"), STR_LEN("referer"));
     forward_one_header(req, ureq, STR_PTR("user-agent"), STR_LEN("user-agent"));
     // x-forwarded-for: the client's own value (if any), extended
-    // with this hop's peer address.
-    let xff = TextBuf { bytes: [0u8; 1600], len: 0 };
+    // with this hop's peer address. Built in the caller's scratch
+    // (see ProxyScratch); only its length resets on entry.
+    sc.xff.len = 0;
     let old: ptr = PTR_NULL();
     let old_len: u64 = 0;
     if sa_http_server_req_get_header(req, STR_PTR("x-forwarded-for"), STR_LEN("x-forwarded-for"), &old, &old_len) == 0 {
-        tb_push(&xff, old, old_len);
+        tb_push(&sc.xff, old, old_len);
     };
     if peer_known {
-        if xff.len > 0 {
-            tb_push(&xff, STR_PTR(", "), STR_LEN(", "));
+        if sc.xff.len > 0 {
+            tb_push(&sc.xff, STR_PTR(", "), STR_LEN(", "));
         };
-        tb_push(&xff, peer, peer_len);
+        tb_push(&sc.xff, peer, peer_len);
         sa_http_client_req_add_header_v2(ureq, STR_PTR("x-real-ip"), STR_LEN("x-real-ip"), peer, peer_len);
     };
-    if xff.len > 0 {
-        let xp: ptr = PTR_BYTE_ADD(&xff.bytes, 0);
-        sa_http_client_req_add_header_v2(ureq, STR_PTR("x-forwarded-for"), STR_LEN("x-forwarded-for"), xp, xff.len);
+    if sc.xff.len > 0 {
+        let xp: ptr = PTR_BYTE_ADD(&sc.xff.bytes, 0);
+        sa_http_client_req_add_header_v2(ureq, STR_PTR("x-forwarded-for"), STR_LEN("x-forwarded-for"), xp, sc.xff.len);
     };
     sa_http_client_req_add_header_v2(ureq, STR_PTR("x-forwarded-proto"), STR_LEN("x-forwarded-proto"), STR_PTR("http"), STR_LEN("http"));
 }
@@ -305,21 +342,22 @@ fn proxy_attempt(req: ptr, pc: &ProxyConfig, slot: u64,
                  method_code: u8,
                  target: ptr, target_len: u64,
                  peer: ptr, peer_len: u64, peer_known: bool,
-                 chunk_bp: ptr) -> AttemptResult {
+                 chunk_bp: ptr, sc: &ProxyScratch) -> AttemptResult {
     let ar = AttemptResult { relayed: false, net_status: 6, status: 0, body_bytes: 0 };
-    // URL: http://host:port<target>
-    let url = TextBuf { bytes: [0u8; 1600], len: 0 };
-    tb_push(&url, STR_PTR("http://"), STR_LEN("http://"));
+    // URL: http://host:port<target>. Built in the caller's
+    // scratch (see ProxyScratch); only its length resets.
+    sc.url.len = 0;
+    tb_push(&sc.url, STR_PTR("http://"), STR_LEN("http://"));
     let hlen: u64 = pc.srv_host_lens[slot];
     let j: u64 = 0;
     while j < hlen {
-        tb_push_byte(&url, pc.srv_hosts[slot * 64 + j]);
+        tb_push_byte(&sc.url, pc.srv_hosts[slot * 64 + j]);
         j = j + 1;
     }
-    tb_push_byte(&url, 58);
-    tb_push_dec(&url, pc.srv_ports[slot] as u64);
-    tb_push(&url, target, target_len);
-    let url_ptr: ptr = PTR_BYTE_ADD(&url.bytes, 0);
+    tb_push_byte(&sc.url, 58);
+    tb_push_dec(&sc.url, pc.srv_ports[slot] as u64, &sc.dec);
+    tb_push(&sc.url, target, target_len);
+    let url_ptr: ptr = PTR_BYTE_ADD(&sc.url.bytes, 0);
     // The wire method is the client's own method, HEAD included:
     // the D6 defect that forced an as-GET fetch in M1 is fixed in
     // the std client (a HEAD response is head-only by definition
@@ -330,12 +368,12 @@ fn proxy_attempt(req: ptr, pc: &ProxyConfig, slot: u64,
         return ar;
     };
     let ureq: ptr = PTR_NULL();
-    if sa_http_client_req_new_v2(client, method_code, url_ptr, url.len, &ureq) != 0 {
+    if sa_http_client_req_new_v2(client, method_code, url_ptr, sc.url.len, &ureq) != 0 {
         sa_http_client_free(client);
         ar.net_status = 5;
         return ar;
     };
-    proxy_forward_headers(req, ureq, peer, peer_len, peer_known);
+    proxy_forward_headers(req, ureq, peer, peer_len, peer_known, sc);
     if method_code != 1 {
         if method_code != 5 {
             let bptr: ptr = PTR_NULL();
@@ -362,16 +400,20 @@ fn proxy_attempt(req: ptr, pc: &ProxyConfig, slot: u64,
         // (its body is empty by construction); preserve the
         // upstream content-length via the G1 head shape and no
         // body bytes reach the client.
-        let clen = DictNum { value: 0 };
+        // The content-length out-box is the caller's scratch
+        // num (see ProxyScratch); parse_u64_bytes writes it only
+        // on success, so it is zeroed first, preserving the
+        // fresh-literal semantics.
+        sc.num.value = 0;
         let hv: ptr = PTR_NULL();
         let hl: u64 = 0;
         if sa_http_client_resp_get_header(uresp, STR_PTR("content-length"), STR_LEN("content-length"), &hv, &hl) == 0 {
-            parse_u64_bytes(hv, hl, &clen);
+            parse_u64_bytes(hv, hl, &sc.num);
         };
         let sresp: ptr = PTR_NULL();
         if sa_http_server_resp_new_v2(req, ar.status as u16, &sresp) == 0 {
             proxy_relay_headers(uresp, sresp, false);
-            sa_http_server_resp_send_head_v2(sresp, clen.value, 5000);
+            sa_http_server_resp_send_head_v2(sresp, sc.num.value, 5000);
             sa_http_server_resp_free_v2(sresp);
         };
         ar.body_bytes = 0;
@@ -426,7 +468,7 @@ fn proxy_serve(req: ptr, pc: &ProxyConfig, dz: &DictZones,
                query_ptr: ptr, query_len: u64,
                norm_ptr: ptr, norm_len: u64,
                peer_ptr: ptr, peer_len: u64, peer_known: bool,
-               now: u64, tbuf: &TextBuf, chunk_bp: ptr) -> ProxyResult {
+               now: u64, tbuf: &TextBuf, chunk_bp: ptr, sc: &ProxyScratch) -> ProxyResult {
     let res = ProxyResult { status: 0, body_bytes: 0 };
     let pool_idx: u64 = pc.route_pools[route_idx as u64];
     let code: u8 = proxy_method_code(method_ptr, method_len);
@@ -453,13 +495,13 @@ fn proxy_serve(req: ptr, pc: &ProxyConfig, dz: &DictZones,
         tb_push(tbuf, query_ptr, query_len);
     };
     let target_ptr: ptr = PTR_BYTE_ADD(&tbuf.bytes, 0);
-    stats_incr(pc, dz, pool_idx, STR_PTR("requests"), STR_LEN("requests"), now);
+    stats_incr(pc, dz, pool_idx, STR_PTR("requests"), STR_LEN("requests"), now, sc);
     let server_count: u64 = pc.pool_server_counts[pool_idx];
     let last_status: u32 = 6;
     let attempt: u64 = 0;
     while attempt < server_count {
         let slot: u64 = proxyconf_pool_pick(pc, pool_idx);
-        let ar = proxy_attempt(req, pc, slot, code, target_ptr, tbuf.len, peer_ptr, peer_len, peer_known, chunk_bp);
+        let ar = proxy_attempt(req, pc, slot, code, target_ptr, tbuf.len, peer_ptr, peer_len, peer_known, chunk_bp, sc);
         if ar.relayed {
             res.status = ar.status;
             res.body_bytes = ar.body_bytes;
@@ -468,7 +510,7 @@ fn proxy_serve(req: ptr, pc: &ProxyConfig, dz: &DictZones,
         last_status = ar.net_status;
         attempt = attempt + 1;
     }
-    stats_incr(pc, dz, pool_idx, STR_PTR("errors"), STR_LEN("errors"), now);
+    stats_incr(pc, dz, pool_idx, STR_PTR("errors"), STR_LEN("errors"), now, sc);
     if last_status == 3 {
         res.status = 504;
         res.body_bytes = proxy_send_simple(req, 504, STR_PTR("gateway timeout\n"), STR_LEN("gateway timeout\n"));

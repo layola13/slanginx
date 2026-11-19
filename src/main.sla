@@ -90,6 +90,13 @@ struct Outcome {
     acl_v: U64Box,
     cand: [u8; 1400],
     tbuf: TextBuf,
+    // Proxy/status route scratch (same defect class, same
+    // fix): stats/url/xff TextBufs, the tb_push_dec DecText and
+    // the stats DictNum were per-call literals / by-value
+    // returns inside proxy.sla, materialized on the heap per
+    // proxied request and never reclaimed. proxy.sla fills
+    // this in place; only length fields reset per request.
+    px: ProxyScratch,
     chunk: [u8; 4096],
 }
 
@@ -292,7 +299,7 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones, o: &
     if is_get {
         if bytes_eq_lit(norm_ptr, o.resbuf.len, STR_PTR("__slanginx/status"), STR_LEN("__slanginx/status")) {
             o.tbuf.len = 0;
-            if proxy_status_body(pc, dz, &o.tbuf, dict_now()) == 0 {
+            if proxy_status_body(pc, dz, &o.tbuf, dict_now(), &o.px) == 0 {
                 let body_ptr: ptr = PTR_BYTE_ADD(&o.tbuf.bytes, 0);
                 o.status = 200;
                 o.body_bytes = send_simple(req, 200, body_ptr, o.tbuf.len);
@@ -312,7 +319,7 @@ fn handle_request(req: ptr, s: &Settings, pc: &ProxyConfig, dz: &DictZones, o: &
                              q_ptr, q_len,
                              norm_ptr, o.resbuf.len,
                              remote_ptr, o.remote_len, peer_known,
-                             dict_now(), &o.tbuf, PTR_BYTE_ADD(&o.chunk, 0));
+                             dict_now(), &o.tbuf, PTR_BYTE_ADD(&o.chunk, 0), &o.px);
         o.status = pr.status;
         o.body_bytes = pr.body_bytes;
         return;
@@ -729,6 +736,7 @@ fn conn_slot_new(idx: u64) -> *ConnSlot {
             acl_v: U64Box { value: 0 },
             cand: [0u8; 1400],
             tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
+            px: proxy_scratch_new(),
             chunk: [0u8; 4096],
         },
         trapped: false, trap_code: 0,
@@ -1231,6 +1239,7 @@ fn worker_state_new(idx: u64) -> *WorkerState {
             acl_v: U64Box { value: 0 },
             cand: [0u8; 1400],
             tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
+            px: proxy_scratch_new(),
             chunk: [0u8; 4096],
         },
         outcome_b: Outcome {
@@ -1248,6 +1257,7 @@ fn worker_state_new(idx: u64) -> *WorkerState {
             acl_v: U64Box { value: 0 },
             cand: [0u8; 1400],
             tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
+            px: proxy_scratch_new(),
             chunk: [0u8; 4096],
         },
         outcome_c: Outcome {
@@ -1265,6 +1275,7 @@ fn worker_state_new(idx: u64) -> *WorkerState {
             acl_v: U64Box { value: 0 },
             cand: [0u8; 1400],
             tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
+            px: proxy_scratch_new(),
             chunk: [0u8; 4096],
         },
         outcome_d: Outcome {
@@ -1282,6 +1293,7 @@ fn worker_state_new(idx: u64) -> *WorkerState {
             acl_v: U64Box { value: 0 },
             cand: [0u8; 1400],
             tbuf: TextBuf { bytes: [0u8; 1600], len: 0 },
+            px: proxy_scratch_new(),
             chunk: [0u8; 4096],
         },
         cur_slot: 0, log_seq: 0, log_done: 0,
