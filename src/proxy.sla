@@ -87,6 +87,7 @@ struct ProxyScratch {
     xff: TextBuf,
     dec: DecText,
     num: DictNum,
+    ds: DictScratch,
 }
 
 fn proxy_scratch_new() -> ProxyScratch {
@@ -97,6 +98,7 @@ fn proxy_scratch_new() -> ProxyScratch {
         xff: TextBuf { bytes: [0u8; 1600], len: 0 },
         dec: DecText { bytes: [0u8; 20], len: 0 },
         num: DictNum { value: 0 },
+        ds: dictscratch_new(),
     };
 }
 
@@ -219,7 +221,7 @@ fn stats_incr(pc: &ProxyConfig, dz: &DictZones, pool_idx: u64, what: ptr, what_l
     stats_key(pc, pool_idx, what, what_len, &sc.key);
     let zp: ptr = PTR_BYTE_ADD(&sc.zname.bytes, 0);
     let kp: ptr = PTR_BYTE_ADD(&sc.key.bytes, 0);
-    dict_incr(zp, sc.zname.len, kp, sc.key.len, 1, 0, now, &sc.num);
+    dict_incr(zp, sc.zname.len, kp, sc.key.len, 1, 0, now, &sc.num, &sc.ds);
 }
 
 fn stats_read(pc: &ProxyConfig, dz: &DictZones, pool_idx: u64, what: ptr, what_len: u64, now: u64, sc: &ProxyScratch) -> u64 {
@@ -231,7 +233,7 @@ fn stats_read(pc: &ProxyConfig, dz: &DictZones, pool_idx: u64, what: ptr, what_l
     stats_key(pc, pool_idx, what, what_len, &sc.key);
     let zp: ptr = PTR_BYTE_ADD(&sc.zname.bytes, 0);
     let kp: ptr = PTR_BYTE_ADD(&sc.key.bytes, 0);
-    if dict_get_num(zp, sc.zname.len, kp, sc.key.len, &sc.num, now) != 0 {
+    if dict_get_num(zp, sc.zname.len, kp, sc.key.len, &sc.num, now, &sc.ds) != 0 {
         return 0;
     };
     return sc.num.value;

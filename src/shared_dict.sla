@@ -206,16 +206,36 @@ fn dict_entry_live(exp: u64, now: u64) -> bool {
     return now < exp;
 }
 
-fn dict_cell(zone: ptr, zone_len: u64, key: ptr, key_len: u64, exp: bool) -> CellName {
-    let c = CellName { bytes: [0u8; 192], len: 0 };
-    cell_push(&c, STR_PTR("sd/"), STR_LEN("sd/"));
-    cell_push(&c, zone, zone_len);
-    cell_push_byte(&c, 47);
-    cell_push(&c, key, key_len);
+// Fill a caller-owned CellName in place. The by-value form
+// materialized a 200-byte CellName on the heap per call and
+// was never reclaimed (the DEF-SLANGINX-REQ-MEM-GROWTH
+// materialization class); the dict hot path (dict_incr /
+// dict_get_num, called per proxied request by the proxy stats)
+// threads one DictScratch through instead. dict_set / dict_get
+// are cold (config/test time only) and keep per-call locals.
+fn dict_cell(zone: ptr, zone_len: u64, key: ptr, key_len: u64, exp: bool, out: &CellName) {
+    out.len = 0;
+    cell_push(out, STR_PTR("sd/"), STR_LEN("sd/"));
+    cell_push(out, zone, zone_len);
+    cell_push_byte(out, 47);
+    cell_push(out, key, key_len);
     if exp {
-        cell_push(&c, STR_PTR("#e"), STR_LEN("#e"));
+        cell_push(out, STR_PTR("#e"), STR_LEN("#e"));
     };
-    return c;
+}
+
+fn cellname_new() -> CellName {
+    return CellName { bytes: [0u8; 192], len: 0 };
+}
+
+// Caller-owned scratch for the dict hot path (see dict_cell).
+struct DictScratch {
+    cell: CellName,
+    exp: DictNum,
+}
+
+fn dictscratch_new() -> DictScratch {
+    return DictScratch { cell: CellName { bytes: [0u8; 192], len: 0 }, exp: DictNum { value: 0 } };
 }
 
 fn dict_key_ok(key: ptr, key_len: u64) -> bool {
@@ -243,8 +263,8 @@ fn dict_zone_ok(zone_len: u64) -> bool {
 
 // Read the expiry cell. Missing cell = no expiry (0). Returns
 // DICT_OK / DICT_STD_ERR; res.value receives the expiry.
-fn dict_read_exp(zone: ptr, zone_len: u64, key: ptr, key_len: u64, res: &DictNum) -> i32 {
-    let cell = dict_cell(zone, zone_len, key, key_len, true);
+fn dict_read_exp(zone: ptr, zone_len: u64, key: ptr, key_len: u64, res: &DictNum, cell: &CellName) -> i32 {
+    dict_cell(zone, zone_len, key, key_len, true, cell);
     let cp: ptr = PTR_BYTE_ADD(&cell.bytes, 0);
     let v: u64 = 0;
     let st: i32 = sa_global_u64_get(cp, cell.len, &v);
@@ -272,7 +292,9 @@ fn dict_set(zone: ptr, zone_len: u64, cap: u64,
     if val_len > DICT_VALUE_MAX {
         return DICT_BAD_ARG;
     };
-    let cell = dict_cell(zone, zone_len, key, key_len, false);
+    let cell = cellname_new();
+    dict_cell(zone, zone_len, key, key_len, false, &cell);
+    let aux = cellname_new();
     let cp: ptr = PTR_BYTE_ADD(&cell.bytes, 0);
     // New key? Probe with a zero-capacity get: 0 or 9 means the
     // cell exists, 3 (NOT_FOUND) means it does not.
@@ -291,10 +313,10 @@ fn dict_set(zone: ptr, zone_len: u64, cap: u64,
         };
     };
     if is_new {
-        let ccell = dict_cell(zone, zone_len, STR_PTR("#n"), STR_LEN("#n"), false);
-        let ccp: ptr = PTR_BYTE_ADD(&ccell.bytes, 0);
+        dict_cell(zone, zone_len, STR_PTR("#n"), STR_LEN("#n"), false, &aux);
+        let ccp: ptr = PTR_BYTE_ADD(&aux.bytes, 0);
         let count: u64 = 0;
-        let cst: i32 = sa_global_u64_get(ccp, ccell.len, &count);
+        let cst: i32 = sa_global_u64_get(ccp, aux.len, &count);
         if cst == 0 {
         } else {
             if cst == 3 {
@@ -311,20 +333,20 @@ fn dict_set(zone: ptr, zone_len: u64, cap: u64,
         return DICT_STD_ERR;
     };
     if is_new {
-        let ccell2 = dict_cell(zone, zone_len, STR_PTR("#n"), STR_LEN("#n"), false);
-        let ccp2: ptr = PTR_BYTE_ADD(&ccell2.bytes, 0);
+        dict_cell(zone, zone_len, STR_PTR("#n"), STR_LEN("#n"), false, &aux);
+        let ccp2: ptr = PTR_BYTE_ADD(&aux.bytes, 0);
         let bumped: u64 = 0;
-        if sa_global_u64_add(ccp2, ccell2.len, 1, &bumped) != 0 {
+        if sa_global_u64_add(ccp2, aux.len, 1, &bumped) != 0 {
             return DICT_STD_ERR;
         };
     };
-    let ecell = dict_cell(zone, zone_len, key, key_len, true);
-    let ecp: ptr = PTR_BYTE_ADD(&ecell.bytes, 0);
+    dict_cell(zone, zone_len, key, key_len, true, &aux);
+    let ecp: ptr = PTR_BYTE_ADD(&aux.bytes, 0);
     let target: u64 = 0;
     if ttl_s > 0 {
         target = now + ttl_s;
     };
-    if sa_global_u64_set(ecp, ecell.len, target) != 0 {
+    if sa_global_u64_set(ecp, aux.len, target) != 0 {
         return DICT_STD_ERR;
     };
     return DICT_OK;
@@ -341,13 +363,14 @@ fn dict_get(zone: ptr, zone_len: u64,
         return DICT_BAD_ARG;
     };
     let exp = DictNum { value: 0 };
-    if dict_read_exp(zone, zone_len, key, key_len, &exp) != DICT_OK {
+    let cell = cellname_new();
+    if dict_read_exp(zone, zone_len, key, key_len, &exp, &cell) != DICT_OK {
         return DICT_STD_ERR;
     };
     if !dict_entry_live(exp.value, now) {
         return DICT_NOT_FOUND;
     };
-    let cell = dict_cell(zone, zone_len, key, key_len, false);
+    dict_cell(zone, zone_len, key, key_len, false, &cell);
     let cp: ptr = PTR_BYTE_ADD(&cell.bytes, 0);
     let need: u64 = 0;
     let st: i32 = sa_global_bytes_get(cp, cell.len, out, out_cap, &need);
@@ -368,32 +391,34 @@ fn dict_get(zone: ptr, zone_len: u64,
 fn dict_incr(zone: ptr, zone_len: u64,
              key: ptr, key_len: u64,
              delta: i64, ttl_s: u64, now: u64,
-             res: &DictNum) -> i32 {
+             res: &DictNum, ds: &DictScratch) -> i32 {
     if !dict_zone_ok(zone_len) {
         return DICT_BAD_ARG;
     };
     if !dict_key_ok(key, key_len) {
         return DICT_BAD_ARG;
     };
-    let exp = DictNum { value: 0 };
-    if dict_read_exp(zone, zone_len, key, key_len, &exp) != DICT_OK {
+    // ds is the caller's scratch (see dict_cell): the expiry
+    // box and the cell name are filled in place, sequentially.
+    ds.exp.value = 0;
+    if dict_read_exp(zone, zone_len, key, key_len, &ds.exp, &ds.cell) != DICT_OK {
         return DICT_STD_ERR;
     };
-    let cell = dict_cell(zone, zone_len, key, key_len, false);
-    let cp: ptr = PTR_BYTE_ADD(&cell.bytes, 0);
-    if dict_entry_live(exp.value, now) {
+    dict_cell(zone, zone_len, key, key_len, false, &ds.cell);
+    let cp: ptr = PTR_BYTE_ADD(&ds.cell.bytes, 0);
+    if dict_entry_live(ds.exp.value, now) {
         let v: u64 = 0;
-        if sa_global_u64_add(cp, cell.len, delta, &v) != 0 {
+        if sa_global_u64_add(cp, ds.cell.len, delta, &v) != 0 {
             return DICT_STD_ERR;
         };
         res.value = v;
         // Creation-time TTL: a counter born from this incr with
         // no expiry recorded yet adopts the caller's TTL.
-        if exp.value == 0 {
+        if ds.exp.value == 0 {
             if ttl_s > 0 {
-                let ecell = dict_cell(zone, zone_len, key, key_len, true);
-                let ecp: ptr = PTR_BYTE_ADD(&ecell.bytes, 0);
-                if sa_global_u64_set(ecp, ecell.len, now + ttl_s) != 0 {
+                dict_cell(zone, zone_len, key, key_len, true, &ds.cell);
+                let ecp: ptr = PTR_BYTE_ADD(&ds.cell.bytes, 0);
+                if sa_global_u64_set(ecp, ds.cell.len, now + ttl_s) != 0 {
                     return DICT_STD_ERR;
                 };
             };
@@ -401,17 +426,17 @@ fn dict_incr(zone: ptr, zone_len: u64,
         return DICT_OK;
     };
     // Expired: restart from the delta, with a fresh expiry.
-    if sa_global_u64_set(cp, cell.len, delta as u64) != 0 {
+    if sa_global_u64_set(cp, ds.cell.len, delta as u64) != 0 {
         return DICT_STD_ERR;
     };
     res.value = delta as u64;
-    let ecell2 = dict_cell(zone, zone_len, key, key_len, true);
-    let ecp2: ptr = PTR_BYTE_ADD(&ecell2.bytes, 0);
+    dict_cell(zone, zone_len, key, key_len, true, &ds.cell);
+    let ecp2: ptr = PTR_BYTE_ADD(&ds.cell.bytes, 0);
     let target: u64 = 0;
     if ttl_s > 0 {
         target = now + ttl_s;
     };
-    if sa_global_u64_set(ecp2, ecell2.len, target) != 0 {
+    if sa_global_u64_set(ecp2, ds.cell.len, target) != 0 {
         return DICT_STD_ERR;
     };
     return DICT_OK;
@@ -419,24 +444,24 @@ fn dict_incr(zone: ptr, zone_len: u64,
 
 fn dict_get_num(zone: ptr, zone_len: u64,
                 key: ptr, key_len: u64,
-                res: &DictNum, now: u64) -> i32 {
+                res: &DictNum, now: u64, ds: &DictScratch) -> i32 {
     if !dict_zone_ok(zone_len) {
         return DICT_BAD_ARG;
     };
     if !dict_key_ok(key, key_len) {
         return DICT_BAD_ARG;
     };
-    let exp = DictNum { value: 0 };
-    if dict_read_exp(zone, zone_len, key, key_len, &exp) != DICT_OK {
+    ds.exp.value = 0;
+    if dict_read_exp(zone, zone_len, key, key_len, &ds.exp, &ds.cell) != DICT_OK {
         return DICT_STD_ERR;
     };
-    if !dict_entry_live(exp.value, now) {
+    if !dict_entry_live(ds.exp.value, now) {
         return DICT_NOT_FOUND;
     };
-    let cell = dict_cell(zone, zone_len, key, key_len, false);
-    let cp: ptr = PTR_BYTE_ADD(&cell.bytes, 0);
+    dict_cell(zone, zone_len, key, key_len, false, &ds.cell);
+    let cp: ptr = PTR_BYTE_ADD(&ds.cell.bytes, 0);
     let v: u64 = 0;
-    let st: i32 = sa_global_u64_get(cp, cell.len, &v);
+    let st: i32 = sa_global_u64_get(cp, ds.cell.len, &v);
     if st == 0 {
         res.value = v;
         return DICT_OK;

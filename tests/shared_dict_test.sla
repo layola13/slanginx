@@ -44,13 +44,14 @@
 
 @test "incr accumulates and get_num reads back"() {
     let n = dictnum_new();
-    if dict_incr(STR_PTR("tz-incr"), STR_LEN("tz-incr"), STR_PTR("n"), STR_LEN("n"), 5, 0, 1000, &n) != DICT_OK { panic(541); };
+    let ds = dictscratch_new();
+    if dict_incr(STR_PTR("tz-incr"), STR_LEN("tz-incr"), STR_PTR("n"), STR_LEN("n"), 5, 0, 1000, &n, &ds) != DICT_OK { panic(541); };
     if n.value != 5 { panic(542); };
-    if dict_incr(STR_PTR("tz-incr"), STR_LEN("tz-incr"), STR_PTR("n"), STR_LEN("n"), 3, 0, 1000, &n) != DICT_OK { panic(543); };
+    if dict_incr(STR_PTR("tz-incr"), STR_LEN("tz-incr"), STR_PTR("n"), STR_LEN("n"), 3, 0, 1000, &n, &ds) != DICT_OK { panic(543); };
     if n.value != 8 { panic(544); };
-    if dict_get_num(STR_PTR("tz-incr"), STR_LEN("tz-incr"), STR_PTR("n"), STR_LEN("n"), &n, 1000) != DICT_OK { panic(545); };
+    if dict_get_num(STR_PTR("tz-incr"), STR_LEN("tz-incr"), STR_PTR("n"), STR_LEN("n"), &n, 1000, &ds) != DICT_OK { panic(545); };
     if n.value != 8 { panic(546); };
-    if dict_get_num(STR_PTR("tz-incr"), STR_LEN("tz-incr"), STR_PTR("missing"), STR_LEN("missing"), &n, 1000) != DICT_NOT_FOUND { panic(547); };
+    if dict_get_num(STR_PTR("tz-incr"), STR_LEN("tz-incr"), STR_PTR("missing"), STR_LEN("missing"), &n, 1000, &ds) != DICT_NOT_FOUND { panic(547); };
 }
 
 @test "ttl expiry is logical and incr restarts after it"() {
@@ -58,13 +59,14 @@
     let bp: ptr = PTR_BYTE_ADD(&buf, 0);
     let r = dictread_new();
     let n = dictnum_new();
+    let ds = dictscratch_new();
     if dict_set(STR_PTR("tz-ttl"), STR_LEN("tz-ttl"), 8, STR_PTR("s"), STR_LEN("s"), STR_PTR("v"), STR_LEN("v"), 10, 1000) != DICT_OK { panic(551); };
     if dict_get(STR_PTR("tz-ttl"), STR_LEN("tz-ttl"), STR_PTR("s"), STR_LEN("s"), bp, 16, &r, 1009) != DICT_OK { panic(552); };
     if dict_get(STR_PTR("tz-ttl"), STR_LEN("tz-ttl"), STR_PTR("s"), STR_LEN("s"), bp, 16, &r, 1010) != DICT_NOT_FOUND { panic(553); };
-    if dict_incr(STR_PTR("tz-ttl"), STR_LEN("tz-ttl"), STR_PTR("c"), STR_LEN("c"), 1, 10, 1000, &n) != DICT_OK { panic(554); };
+    if dict_incr(STR_PTR("tz-ttl"), STR_LEN("tz-ttl"), STR_PTR("c"), STR_LEN("c"), 1, 10, 1000, &n, &ds) != DICT_OK { panic(554); };
     if n.value != 1 { panic(555); };
-    if dict_get_num(STR_PTR("tz-ttl"), STR_LEN("tz-ttl"), STR_PTR("c"), STR_LEN("c"), &n, 1015) != DICT_NOT_FOUND { panic(556); };
-    if dict_incr(STR_PTR("tz-ttl"), STR_LEN("tz-ttl"), STR_PTR("c"), STR_LEN("c"), 7, 10, 1015, &n) != DICT_OK { panic(557); };
+    if dict_get_num(STR_PTR("tz-ttl"), STR_LEN("tz-ttl"), STR_PTR("c"), STR_LEN("c"), &n, 1015, &ds) != DICT_NOT_FOUND { panic(556); };
+    if dict_incr(STR_PTR("tz-ttl"), STR_LEN("tz-ttl"), STR_PTR("c"), STR_LEN("c"), 7, 10, 1015, &n, &ds) != DICT_OK { panic(557); };
     if n.value != 7 { panic(558); };
 }
 
