@@ -7,7 +7,22 @@ design record is the sala planning page
 was renamed from the working name on that page to the repository
 name, slanginx).
 
-## M1 status (this delivery)
+## Performance tuning (2026-11-20)
+
+The default merged serve model uses **16 workers** (`workers` in
+`[server]`). This box is a noisy shared 8-core VM: an interleaved
+workers=8 vs workers=16 sweep showed only a modest, variable gain
+(roughly flat at c10, ~+10% median at c50); a larger 2.3x seen in
+a non-interleaved sweep was a measurement artifact of load drift,
+not a reproducible result. workers=32+ regress because the single
+supervisor log writer cannot drain the completion stream. Tune to
+~2x the core count with a ceiling near 16-20 (lower on small-core
+boxes). See `docs/PERF_TUNING_DELIVERY.md` for the full method and
+the honest nginx comparison (static remains below the T50 gate
+because a single process cannot match nginx's multi-process
+workers; proxy meets T50).
+
+## M1 status
 
 Everything from M0, plus (details and measured evidence in
 `docs/M1_DELIVERY.md`):
@@ -49,7 +64,7 @@ with explicit 403), the two-layer configuration (declarative
 TOML + typed code layer in `src/config.sla` with the
 `/internal/` deny rule and the `/assets/` alias), the access
 log (one line per request, real peer since M1), and the
-process model: single process, sequential accept loop.
+process model: single process with a configurable merged worker pool (default 16).
 
 ## Registered gaps (M1)
 

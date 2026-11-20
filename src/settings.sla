@@ -19,7 +19,7 @@
 //   index = "index.html"        (string)
 //   access_log = "logs/access.log" (string)
 //   max_file_bytes = 33554432   (integer)
-//   workers = 8                 (integer, merged serve model)
+//   workers = 16                (integer, merged serve model)
 //   serve_model = "merged"      (string: "dispatch" | "merged")
 
 @import "sa_std/encoding/toml.sai"
@@ -109,7 +109,7 @@ fn settings_blank() -> Settings {
         index: [0u8; 128], index_len: 0,
         log_path: [0u8; 512], log_len: 0,
         max_file_bytes: 33554432,
-        workers: 8,
+        workers: 16,
         serve_model: [0u8; 16], serve_model_len: 0,
     };
     copy_lit_host(&s, STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1"));

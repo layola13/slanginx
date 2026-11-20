@@ -15,13 +15,19 @@ max_file_bytes = 33554432
 # hands each request to a per-request goroutine; "merged" =
 # a fixed set of long-lived workers accepts and serves directly
 # (no per-request spawn). workers = the merged model's worker
-# count (1..64, default 8). SA_TASK_CARRIERS is a runtime
-# task-supply knob only: the 2026-11-01 static-tail triage
+# count (1..64, default 16). On this noisy shared 8-core box an
+# interleaved 2026-11-20 sweep found workers=16 only modestly
+# better than 8 (roughly flat at c10, ~+10% at c50); a 2.3x seen
+# in a non-interleaved sweep was load-drift noise, not real.
+# workers >= 32 regress because the single supervisor log writer
+# cannot keep up with the completion stream. Tune to ~2x the core
+# count with a ceiling near 16-20; lower it on small-core boxes.
+# SA_TASK_CARRIERS is a runtime task-supply knob only: the 2026-11-01 static-tail triage
 # measured carriers 8 -> 12 -> 16 with the static c50 p99
 # (~1 s) unchanged, so carriers >= workers + 4 is NOT a
 # latency remedy and must not be cited as one; the tail lives
 # in the std HTTP face's connection service discipline.
-# Defaults: merged, 8.
+# Defaults: merged, 16.
 # serve_model = "merged"
 # workers = 8
 
