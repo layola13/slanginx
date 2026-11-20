@@ -1218,6 +1218,11 @@ struct WorkerState {
     trap_line_pending: bool,
     trap_seq: u64,
     trap_slot: u64,
+    // B_accept_shard: per-worker listen queue. Each merged worker
+    // accepts from its OWN server handle (own SO_REUSEPORT listen
+    // socket on the same host:port), so accepts no longer serialize
+    // on the single shared server handle's mutex.
+    srv: ptr,
 }
 
 fn worker_state_new(idx: u64) -> *WorkerState {
@@ -1307,6 +1312,7 @@ fn worker_state_new(idx: u64) -> *WorkerState {
         },
         cur_slot: 0, log_seq: 0, log_done: 0,
         trap_line_pending: false, trap_seq: 0, trap_slot: 0,
+        srv: PTR_NULL(),
     }));
 }
 
@@ -1355,7 +1361,8 @@ fn merged_worker(job: *WorkerJob) {
             }
         };
         let req: ptr = PTR_NULL();
-        let ast: u32 = sa_http_server_accept_v2((*ctx).srv, WORKER_ACCEPT_MS, &req);
+        // B_accept_shard: accept from this worker's own listen queue.
+        let ast: u32 = sa_http_server_accept_v2((*ws).srv, WORKER_ACCEPT_MS, &req);
         if ast == 0 {
             let slot: u64 = seq % 4;
             (*ws).cur_slot = slot;
@@ -1876,6 +1883,33 @@ fn main() -> i32 {
         (*ctx).workers[si] = worker_state_new(si);
         si = si + 1;
     }
+    // B_accept_shard: per-worker listen queues. Worker 0 reuses the
+    // main server handle; each other merged worker gets its own
+    // server handle bound to the same host:port. SO_REUSEPORT (set
+    // by the std listener) lets all binds succeed and the kernel
+    // shards incoming connections across the per-worker listen
+    // queues, so accepts no longer serialize on one shared handle.
+    // Only for the merged model; the dispatch model keeps the
+    // single shared handle.
+    if use_merged {
+        let ws0: *WorkerState = (*ctx).workers[0];
+        (*ws0).srv = srv;
+        let wi: u64 = 1;
+        while wi < worker_count_v {
+            let wsrv: ptr = PTR_NULL();
+            if sa_http_server_new_v2(&wsrv) != 0 {
+                println("slanginx: per-worker server create failed");
+                return 3;
+            };
+            if sa_http_server_start_v2(wsrv, host_ptr, s.host_len, s.port) != 0 {
+                println("slanginx: per-worker server bind failed");
+                return 3;
+            };
+            let wsv: *WorkerState = (*ctx).workers[wi];
+            (*wsv).srv = wsrv;
+            wi = wi + 1;
+        }
+    };
     if use_merged {
         println("slanginx: serve model merged (workers accept directly)");
         return serve_merged(ctx);
