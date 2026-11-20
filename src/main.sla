@@ -1201,11 +1201,16 @@ struct WorkerState {
     trapped: bool,
     trap_code: i32,
     // (b1-beta) quad-buffered outcome slots: the worker
-    // serves request seq into slot seq%4 and reports it on the
-    // results channel; the supervisor appends the line from the
-    // slot and advances log_done. log_seq/log_done live across
-    // incarnations so a late record can never be overwritten
-    // early. trap_line_pending marks a trapped in-flight
+    // serves request seq into slot seq%4 and advances
+    // log_seq once the slot is fully written; log_seq is the
+    // sole completion signal -- completions no longer travel
+    // on the results channel (memfix: the per-request
+    // select/recv of completion records leaked ~4 KB each).
+    // The supervisor sweeps log_seq/log_done every 1 ms and
+    // appends the line from the slot, then advances log_done.
+    // log_seq/log_done live across incarnations so a late
+    // record can never be overwritten early.
+    // trap_line_pending marks a trapped in-flight
     // request whose line the supervisor appends itself once
     // earlier records have drained (log_done reaches log_seq).
     outcome_a: Outcome,
@@ -1326,10 +1331,12 @@ struct MonitorJob {
 // then return (the monitor reports the exit and the
 // supervisor respawns a fresh incarnation). (b1-beta) lean
 // supervision logging: the worker serves into its
-// quad-buffered outcome slot and reports the completion on
-// the results channel; the supervisor is the only access-log
-// writer. A trap anywhere between accept and the completion
-// report still leaves a loggable in-flight request whose
+// quad-buffered outcome slot and advances log_seq once the
+// slot is fully written; log_seq is the sole completion
+// signal (no per-request channel send -- memfix). The
+// supervisor sweeps the slots every 1 ms and is the only
+// access-log writer. A trap anywhere between accept and the
+// completion report still leaves a loggable in-flight request whose
 // outcome the supervisor reads from the current slot.
 fn merged_worker(job: *WorkerJob) {
     let ctx: *ServerCtx = (*job).ctx;
@@ -1379,11 +1386,15 @@ fn merged_worker(job: *WorkerJob) {
             (*ws).req = PTR_NULL();
             (*ws).in_flight = false;
             (*ws).started = 0;
-            // Completion record on the results channel: kind
-            // bit 2^62, worker idx in bits 40..45, request seq
-            // in the low 40 bits (exit payloads stay below
-            // 2^38, so the kinds never collide).
-            (*ctx).results.send(4611686018427387904 + (*ws).idx * 1099511627776 + seq);
+            // Completion signal (memfix): NO results.send
+            // here -- the per-request channel send/recv leaked
+            // ~4 KB per request. Advancing log_seq is the sole
+            // completion signal; the supervisor sweeps it every
+            // 1 ms (see drain_all_workers). The outcome slot is
+            // fully written before this line, and the worker
+            // waits on log_done before reusing the slot, so the
+            // supervisor can never read a partial or
+            // overwritten record.
             (*ws).log_seq = seq + 1;
             served = served + 1;
             (*ws).inc_served = served;
@@ -1491,33 +1502,36 @@ fn append_slot_line(ctx: *ServerCtx, ws: *WorkerState, slot: u64, force500: bool
     };
 }
 
-// Consume one (b1-beta) completion record: append the line
-// for (idx, seq) from its outcome slot and advance log_done.
-// Records from one worker arrive in send order; a record whose
-// seq is not the expected next one is out of discipline and is
-// dropped (the wait in merged_worker makes it unreachable).
-// Afterwards, a pending trapped line for this worker whose
-// turn has come is appended from the current slot.
-fn handle_log_record(ctx: *ServerCtx, payload: u64) {
-    let idx: u64 = (payload / 1099511627776) % 64;
-    let seq: u64 = payload % 1099511627776;
-    let ws: *WorkerState = (*ctx).workers[idx];
-    // A trapped line owed by the supervisor is appended as
-    // soon as every earlier record has drained; its slot
-    // content is still intact because the next incarnation
-    // cannot reuse that slot before log_done passes trap_seq.
-    if (*ws).trap_line_pending {
-        if (*ws).log_done == (*ws).trap_seq {
+// Supervisor-side log drain (shared-memory poll, memfix):
+// sweep one worker's completed requests in log_done order
+// and append each line from its outcome slot. A pending
+// trapped line is appended as soon as every earlier record
+// has drained, in exactly its sequence position -- the same
+// order the old channel-driven handle_log_record produced.
+// A stale log_seq read only makes this round sweep fewer
+// records; the next round catches up.
+fn drain_worker_logs(ctx: *ServerCtx, ws: *WorkerState) {
+    while (*ws).log_done < (*ws).log_seq {
+        if (*ws).trap_line_pending && (*ws).log_done == (*ws).trap_seq {
             append_slot_line(ctx, ws, (*ws).trap_slot, true);
             (*ws).log_done = (*ws).trap_seq + 1;
             (*ws).trap_line_pending = false;
+        } else {
+            append_slot_line(ctx, ws, (*ws).log_done % 4, false);
+            (*ws).log_done = (*ws).log_done + 1;
         };
-    };
-    if seq != (*ws).log_done {
-        return;
-    };
-    append_slot_line(ctx, ws, seq % 4, false);
-    (*ws).log_done = seq + 1;
+    }
+}
+
+// Sweep every worker's pending log records, in worker order.
+// (Cross-worker order was never guaranteed: the old channel
+// arrival order was equally arbitrary under concurrency.)
+fn drain_all_workers(ctx: *ServerCtx) {
+    let i: u64 = 0;
+    while i < (*ctx).worker_count {
+        drain_worker_logs(ctx, (*ctx).workers[i]);
+        i = i + 1;
+    }
 }
 
 // Process one incarnation exit report: account traps against
@@ -1540,7 +1554,7 @@ fn handle_exit_report(ctx: *ServerCtx, payload: u64, traps: &TrapState) -> i32 {
             // sequence can be advanced here: the line is
             // appended now if earlier records have drained
             // (log_done == log_seq), else it stays pending
-            // until handle_log_record catches up (the slot is
+            // until the log drain catches up (the slot is
             // not reused before then: the next incarnation's
             // wait keys on log_done). The trapped request
             // handle is deliberately NOT released (see below).
@@ -1629,29 +1643,13 @@ struct ExitBox {
     closed: bool,
 }
 
-// Blocking exit-report wait in 1 s slices: kind 1 = a report
-// arrived, kind 3 = the slice timed out (the caller runs the
-// watchdog scan). The merged supervisor's waits use ONLY the
-// select shapes, like the dispatcher's (no Chan::len()).
-fn select_exit(ctx: *ServerCtx, out: &ExitBox) {
-    out.payload = 0;
-    out.kind = 0;
-    out.closed = false;
-    select {
-        case let (v, closed) = (*ctx).results.recv() {
-            out.kind = 1;
-            out.payload = v;
-            out.closed = closed;
-        }
-        timeout(1000000000) {
-            out.kind = 3;
-        }
-    }
-}
-
 // Poll variant (timeout 0): kind 3 means the channel is empty
-// right now. The supervisor drains with this after each
-// blocking wake so one wake pays for the whole pending batch.
+// right now. The merged supervisor polls this ~10 times per
+// second for incarnation-exit reports only (memfix:
+// completions no longer travel on the results channel, so
+// there is no per-request recv here). The supervisor drains
+// with this when polling so one poll pays for the whole
+// pending batch of exit reports.
 fn select_exit_poll(ctx: *ServerCtx, out: &ExitBox) {
     out.payload = 0;
     out.kind = 0;
@@ -1668,30 +1666,14 @@ fn select_exit_poll(ctx: *ServerCtx, out: &ExitBox) {
     }
 }
 
-// Handle one results-channel item: a completion record
-// (kind bit 2^62) is appended by handle_log_record; anything
-// else is an incarnation exit report. Returns 0 for a log
-// record, 1 for a handled exit report, or the nonzero
-// supervisor verdict of handle_exit_report.
-fn handle_result_item(ctx: *ServerCtx, payload: u64, traps: &TrapState) -> i32 {
-    if payload >= 4611686018427387904 {
-        handle_log_record(ctx, payload);
-        return 0;
-    };
-    let rc = handle_exit_report(ctx, payload, traps);
-    if rc != 0 {
-        return rc;
-    };
-    return 1;
-}
-
 // One supervisor generation: spawn any missing workers, then
-// consume up to GEN_EVENT_BUDGET exit reports (watchdog scans
-// run on the 1 s timeout slices), and return 0 so serve_merged
-// starts the next generation on a fresh frame. Trap accounting
-// state lives in the caller's TrapState and persists across
-// generations (strictly stronger than the dispatch model,
-// whose accounting resets per generation).
+// sweep log records every 1 ms and poll for incarnation-exit
+// reports every ~100 ms (watchdog scans run every ~1 s),
+// and return 0 so serve_merged starts the next generation
+// on a fresh frame. Trap accounting state lives in the
+// caller's TrapState and persists across generations
+// (strictly stronger than the dispatch model, whose
+// accounting resets per generation).
 fn serve_merged_generation(ctx: *ServerCtx, traps: &TrapState) -> i32 {
     let i: u64 = 0;
     while i < (*ctx).worker_count {
@@ -1702,49 +1684,46 @@ fn serve_merged_generation(ctx: *ServerCtx, traps: &TrapState) -> i32 {
         i = i + 1;
     }
     let events: u64 = 0;
-    // One ExitBox per generation, reused across iterations and
-    // drain records (DEF-SLANGINX-REQ-MEM-GROWTH): the per-
-    // record literal materialized on the heap per request.
-    // select_exit / select_exit_poll reset every field on
-    // entry, so reuse is safe.
-    let eb = ExitBox { payload: 0, kind: 0, closed: false };
+    // One ExitBox per generation, reused across polls
+    // (DEF-SLANGINX-REQ-MEM-GROWTH): the per-record literal
+    // materialized on the heap per request.
+    // select_exit_poll resets every field on entry, so reuse
+    // is safe.
     let db = ExitBox { payload: 0, kind: 0, closed: false };
+    // Shared-memory poll loop (memfix): completions no longer
+    // arrive on the results channel, so the supervisor sweeps
+    // the workers' log_seq/log_done every tick instead of
+    // blocking on select. The tick MUST be 1 ms: with only
+    // four outcome slots per worker, a 1 s tick would cap the
+    // whole server at ~64 req/s. Exit reports still arrive on
+    // the results channel (about one per incarnation) and are
+    // polled every ~100 ms; the watchdog runs every ~1 s.
+    let poll_count: u64 = 0;
     while events < GEN_EVENT_BUDGET {
-        select_exit(ctx, &eb);
-        if eb.closed {
-            return 3;
-        };
-        if eb.kind == 1 {
-            let rc = handle_result_item(ctx, eb.payload, traps);
-            if rc == 1 {
-                events = events + 1;
-            } else {
-                if rc != 0 {
-                    return rc;
-                };
-            };
-            // Drain: poll until the channel is empty so the
-            // wake cost is paid once per batch, not per record.
-            let draining: bool = true;
-            while draining {
+        drain_all_workers(ctx);
+        sa_task_sleep_ms(1);
+        poll_count = poll_count + 1;
+        if poll_count % 100 == 0 {
+            // Drain any pending exit reports so one poll pays
+            // for the whole batch.
+            let polling: bool = true;
+            while polling {
                 select_exit_poll(ctx, &db);
                 if db.closed {
                     return 3;
                 };
                 if db.kind == 1 {
-                    let drc = handle_result_item(ctx, db.payload, traps);
-                    if drc == 1 {
-                        events = events + 1;
-                    } else {
-                        if drc != 0 {
-                            return drc;
-                        };
+                    let rc = handle_exit_report(ctx, db.payload, traps);
+                    if rc != 0 {
+                        return rc;
                     };
+                    events = events + 1;
                 } else {
-                    draining = false;
+                    polling = false;
                 };
             }
-        } else {
+        };
+        if poll_count % 1000 == 0 {
             let rcw = merged_watchdog_scan(ctx);
             if rcw != 0 {
                 return rcw;
@@ -1849,8 +1828,9 @@ fn main() -> i32 {
     // serve section above). The proxy pool cursors need no
     // install step: they are atomic ticket counters zeroed by
     // proxyconf_new (pickfix, see upstream.sla). ---
-    // Merged-model boot state: the results channel (worker
-    // completion records + incarnation-exit reports), and the
+    // Merged-model boot state: the results channel (now
+    // incarnation-exit reports only -- completions are swept
+    // from shared memory, see drain_all_workers), and the
     // serve-model selection read from the settings the
     // operator declared.
     let use_merged: bool = bytes_eq_lit(PTR_BYTE_ADD(&s.serve_model, 0), s.serve_model_len, STR_PTR("merged"), STR_LEN("merged"));
