@@ -22,6 +22,20 @@
 // the operator restarts slanginx to pick up the new file. A
 // failed write returns its status and that line is dropped --
 // the same visibility contract as M1's failed per-request open.
+//
+// Batching (task 82, fix 4): access_log_append now ACCUMULATES
+// lines in the sink buffer (8192 B) and only writes on flush.
+// The supervisor flushes at the end of every drain sweep
+// (drain_all_workers, ~1 ms cadence in the merged model), so a
+// line is visible at most ~1 ms after it is appended, and the
+// log write rate drops from 1/req to ~1/sweep (~0.05/req at
+// 20k req/s). The buffer also flushes itself when it has less
+// than one worst-case line (2048 B) of headroom, so a line is
+// never split across a flush and no line is lost if the
+// supervisor sweep is delayed. If the process is killed, the
+// lines still in the buffer (at most ~1 ms worth) are lost --
+// the same exposure a per-line write has to a kill between the
+// handler and the write, just widened to one sweep.
 
 @import "sa_std/fs.sai"
 @import "sa_std/ptr.sa"
@@ -31,7 +45,7 @@
 struct LogSink {
     fh: u64,
     ready: bool,
-    bytes: [u8; 2048],
+    bytes: [u8; 8192],
     len: u64,
     // Caller-owned decimal scratch for sink_push_dec
     // (DEF-SLANGINX-REQ-MEM-GROWTH): the by-value dec_u64
@@ -40,13 +54,13 @@ struct LogSink {
 }
 
 fn logsink_new() -> LogSink {
-    return LogSink { fh: 0, ready: false, bytes: [0u8; 2048], len: 0, dec: DecText { bytes: [0u8; 20], len: 0 } };
+    return LogSink { fh: 0, ready: false, bytes: [0u8; 8192], len: 0, dec: DecText { bytes: [0u8; 20], len: 0 } };
 }
 
 fn sink_push(s: &LogSink, src: ptr, n: u64) {
     let i: u64 = 0;
     while i < n {
-        if s.len < 2048 {
+        if s.len < 8192 {
             s.bytes[s.len] = PTR_BYTE_AT(src, i);
             s.len = s.len + 1;
         };
@@ -55,7 +69,7 @@ fn sink_push(s: &LogSink, src: ptr, n: u64) {
 }
 
 fn sink_push_byte(s: &LogSink, b: u8) {
-    if s.len < 2048 {
+    if s.len < 8192 {
         s.bytes[s.len] = b;
         s.len = s.len + 1;
     };
@@ -91,6 +105,22 @@ fn access_log_open(s: &LogSink, log_ptr: ptr, log_len: u64) -> i32 {
     return 0;
 }
 
+// Write out whatever lines have accumulated since the last
+// flush. A no-op when the buffer is empty (no syscall), so it
+// is safe to call on every supervisor sweep.
+fn access_log_flush(s: &LogSink) -> i32 {
+    if !s.ready {
+        return 1;
+    };
+    if s.len == 0 {
+        return 0;
+    };
+    let line_ptr: ptr = PTR_BYTE_ADD(&s.bytes, 0);
+    let rc: i32 = sa_fs_file_write_all(s.fh, line_ptr, s.len);
+    s.len = 0;
+    return rc;
+}
+
 fn access_log_append(s: &LogSink,
                      remote_ptr: ptr, remote_len: u64,
                      method_ptr: ptr, method_len: u64,
@@ -100,7 +130,15 @@ fn access_log_append(s: &LogSink,
     if !s.ready {
         return 1;
     };
-    s.len = 0;
+    // Batching: flush first when less than one worst-case line
+    // (2048 B) of headroom remains, so the line appended below
+    // always lands whole in the buffer.
+    if s.len > 6144 {
+        let frc: i32 = access_log_flush(s);
+        if frc != 0 {
+            return frc;
+        };
+    };
     sink_push(s, remote_ptr, remote_len);
     sink_push_byte(s, 32);
     sink_push(s, method_ptr, method_len);
@@ -115,6 +153,5 @@ fn access_log_append(s: &LogSink,
     sink_push(s, ua_ptr, ua_len);
     sink_push_byte(s, 34);
     sink_push_byte(s, 10);
-    let line_ptr: ptr = PTR_BYTE_ADD(&s.bytes, 0);
-    return sa_fs_file_write_all(s.fh, line_ptr, s.len);
+    return 0;
 }

@@ -1532,6 +1532,11 @@ fn drain_all_workers(ctx: *ServerCtx) {
         drain_worker_logs(ctx, (*ctx).workers[i]);
         i = i + 1;
     }
+    // Batching (task 82, fix 4): flush the access-log buffer
+    // once per supervisor sweep (~1 ms), bounding log delay
+    // to one sweep. A failed flush drops the buffered lines;
+    // the next append re-attempts on the following sweep.
+    access_log_flush(&(*ctx).sink);
 }
 
 // Process one incarnation exit report: account traps against
@@ -1754,6 +1759,8 @@ fn serve_merged(ctx: *ServerCtx) -> i32 {
 }
 
 fn main() -> i32 {
+    // task82: cache-bust no-op (forces build-exe cache miss so new libsa_std.a relinks)
+    let _task82_cache_bust: i32 = 83;
     // --- locate the TOML config: $SLANGINX_CONFIG or ./slanginx.toml ---
     let from_env = env_config_path();
     let cfg_buf: [u8; 512] = [0u8; 512];
